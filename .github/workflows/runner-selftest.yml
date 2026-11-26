@@ -1,0 +1,28 @@
+name: Public Runner Self-Test
+on:
+  push:
+    branches:
+      - work/validation-gateway-bounded-process-20261126
+permissions:
+  contents: read
+jobs:
+  bounded-process-selftest:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - name: Load exact public executor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=work/validation-gateway-bounded-process-20261126'
+          $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
+          if ($item.sha -ne 'aa2549525784da0dab93b4a5e064892a418d4311' -or $item.encoding -ne 'base64') {
+            throw 'TRUSTED_EXECUTOR_INTEGRITY_FAILURE'
+          }
+          $bytes = [Convert]::FromBase64String(($item.content -replace '\\s',''))
+          $scriptPath = Join-Path $env:RUNNER_TEMP 'generic-executor-selftest.ps1'
+          [IO.File]::WriteAllBytes($scriptPath,$bytes)
+          [Array]::Clear($bytes,0,$bytes.Length)
+          & pwsh.exe -NoLogo -NoProfile -NonInteractive -File $scriptPath -SelfTest
+          if ($LASTEXITCODE -ne 0) { throw 'PUBLIC_RUNNER_SELFTEST_FAILED' }
+          Write-Output 'PUBLIC_RUNNER_SELFTEST_COMPLETED'
