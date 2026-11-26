@@ -1,0 +1,115 @@
+name: Public Runner Lane 01
+run-name: "Controlled validation lane 01"
+on:
+  push:
+    branches:
+      - ops/brain-lane01-public-runner
+    paths:
+      - "triggers/brain-lane01.signal"
+permissions:
+  contents: read
+concurrency:
+  group: controlled-validation-lane-01
+  cancel-in-progress: false
+jobs:
+  execute:
+    name: Isolated validation task
+    runs-on: windows-2025
+    timeout-minutes: 330
+    environment:
+      name: brain-validation
+    permissions:
+      contents: read
+    steps:
+      - name: Load runner harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Validate lane configuration
+        id: preflight
+        shell: pwsh
+        env:
+          SOURCE_URL_01: \${{ secrets.SOURCE_URL_01 }}
+          SOURCE_SHA256_01: \${{ secrets.SOURCE_SHA256_01 }}
+          EVIDENCE_KEY_B64_01: \${{ secrets.EVIDENCE_KEY_B64_01 }}
+        run: |
+          $missing = @()
+          foreach ($name in 'SOURCE_URL_01','SOURCE_SHA256_01','EVIDENCE_KEY_B64_01') {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { $missing += $name }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Output 'LANE_CONFIGURATION_MISSING'
+            exit 1
+          }
+          if ($env:SOURCE_SHA256_01 -notmatch '^[0-9a-fA-F]{64}$') {
+            Write-Output 'LANE_HASH_CONFIGURATION_INVALID'
+            exit 1
+          }
+          try { $key = [Convert]::FromBase64String($env:EVIDENCE_KEY_B64_01) } catch {
+            Write-Output 'LANE_EVIDENCE_KEY_CONFIGURATION_INVALID'
+            exit 1
+          }
+          if ($key.Length -ne 32) {
+            [Array]::Clear($key,0,$key.Length)
+            Write-Output 'LANE_EVIDENCE_KEY_CONFIGURATION_INVALID'
+            exit 1
+          }
+          [Array]::Clear($key,0,$key.Length)
+          Remove-Item Env:SOURCE_URL_01,Env:SOURCE_SHA256_01,Env:EVIDENCE_KEY_B64_01 -ErrorAction SilentlyContinue
+          Write-Output 'LANE_CONFIGURATION_VALID'
+
+      - name: Execute isolated Candidate validation
+        id: execute
+        if: \${{ steps.preflight.outcome == 'success' }}
+        shell: pwsh
+        env:
+          SOURCE_URL_01: \${{ secrets.SOURCE_URL_01 }}
+          SOURCE_SHA256_01: \${{ secrets.SOURCE_SHA256_01 }}
+          EVIDENCE_KEY_B64_01: \${{ secrets.EVIDENCE_KEY_B64_01 }}
+        run: |
+          $env:SOURCE_URL = $env:SOURCE_URL_01
+          $env:SOURCE_SHA256 = $env:SOURCE_SHA256_01
+          $env:EVIDENCE_KEY_B64 = $env:EVIDENCE_KEY_B64_01
+          Remove-Item Env:SOURCE_URL_01,Env:SOURCE_SHA256_01,Env:EVIDENCE_KEY_B64_01 -ErrorAction SilentlyContinue
+          & "$env:GITHUB_WORKSPACE/.github/scripts/execute.ps1" -Lane '01'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Seal evidence
+        id: seal
+        if: \${{ always() && steps.preflight.outcome == 'success' }}
+        shell: pwsh
+        env:
+          EVIDENCE_KEY_B64_01: \${{ secrets.EVIDENCE_KEY_B64_01 }}
+        run: |
+          $env:EVIDENCE_KEY_B64 = $env:EVIDENCE_KEY_B64_01
+          Remove-Item Env:EVIDENCE_KEY_B64_01 -ErrorAction SilentlyContinue
+          $sealScript = Join-Path $env:GITHUB_WORKSPACE '.github/scripts/seal.ps1'
+          $actualSealHash = (Get-FileHash -LiteralPath $sealScript -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSealHash -ne 'd46036edbfb8a3866336eb10d6289caf0bb4c7ff') {
+            throw 'TRUSTED_SEAL_SCRIPT_INTEGRITY_FAILURE'
+          }
+          & $sealScript
+
+      - name: Publish encrypted evidence only
+        if: \${{ always() && steps.seal.outputs.sealed == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: sealed-evidence-01
+          path: sealed/evidence.bin
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Generic outcome
+        if: \${{ always() }}
+        shell: pwsh
+        run: |
+          if ('\${{ steps.preflight.outcome }}' -ne 'success') {
+            Write-Output 'CONFIGURATION_REQUIRED'
+          } elseif ('\${{ steps.execute.outputs.status }}' -like 'PASS_*') {
+            Write-Output 'CONTROLLED_TASK_COMPLETED'
+          } else {
+            Write-Output 'CONTROLLED_TASK_REQUIRES_REVIEW'
+          }
