@@ -15,6 +15,7 @@ $evidenceRoot = Join-Path $runRoot 'evidence'
 $buildRoot = Join-Path $runRoot 'build'
 $candidateOutputRoot = Join-Path $runRoot 'candidate-output'
 $archivePath = Join-Path $runRoot 'source.zip'
+$script:pythonDependencyRoot = $null
 
 # Read bootstrap inputs once. Never pass these values to any candidate process.
 $sourceUrl = $env:SOURCE_URL
@@ -129,6 +130,19 @@ function Initialize-CandidateSandbox {
 
     $sidAceTraverse = "*$($script:candidateSid):(X)"
     $sidAceModify = "*$($script:candidateSid):(OI)(CI)M"
+
+    if ($script:pythonDependencyRoot) {
+        if (-not (Test-Path -LiteralPath $script:pythonDependencyRoot -PathType Container)) {
+            throw 'VALIDATION_DEPENDENCY_DIRECTORY_MISSING'
+        }
+        $dependencyAce = "*$($script:candidateSid):(OI)(CI)RX"
+        $dependencyDenyAce = "*$($script:candidateSid):(OI)(CI)M"
+        $icacls = Join-Path $env:SystemRoot 'System32/icacls.exe'
+        & $icacls $script:pythonDependencyRoot /deny $dependencyDenyAce /T /C /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'VALIDATION_DEPENDENCY_READONLY_ACL_FAILED' }
+        & $icacls $script:pythonDependencyRoot /grant $dependencyAce /T /C /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'VALIDATION_DEPENDENCY_READ_ACL_FAILED' }
+    }
     $icacls = Join-Path $env:SystemRoot 'System32/icacls.exe'
     & $icacls $env:RUNNER_TEMP /grant $sidAceTraverse /Q | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_TEMP_TRAVERSE_ACL_FAILED' }
@@ -162,6 +176,2047 @@ function Copy-CandidateEvidenceSafely {
         $destinationParent = Split-Path -Parent $destination
         New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null
         [IO.File]::Copy($full,$destination,$true)
+    }
+}
+
+function Initialize-ValidationDependencyWheelhouse {
+    $manifestCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'validation-python-wheelhouse.json' -File -Recurse)
+    if ($manifestCandidates.Count -eq 0) { return }
+    if ($manifestCandidates.Count -ne 1) { throw 'VALIDATION_DEPENDENCY_MANIFEST_AMBIGUOUS' }
+
+    try {
+        $manifestPath = $manifestCandidates[0].FullName
+        $manifestDirectory = $manifestCandidates[0].Directory.FullName
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($manifest.schema -ne 'validation.python-wheelhouse.v1') { throw 'INVALID_SCHEMA' }
+        if ($manifest.artifacts.Count -lt 1 -or $manifest.artifacts.Count -gt 8) { throw 'INVALID_ARTIFACT_COUNT' }
+        if ($manifest.lock_file -notmatch '^[A-Za-z0-9_.-]+    foreach ($ruleName in $script:firewallRuleNames) {
+        Remove-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+    }
+    $script:firewallRuleNames = @()
+    if ($script:candidateUserName) {
+        Remove-LocalUser -Name $script:candidateUserName -ErrorAction SilentlyContinue
+    }
+    if ($script:candidatePassword) {
+        $script:candidatePassword.Dispose()
+        $script:candidatePassword = $null
+    }
+}
+
+function Invoke-Captured {
+    param(
+        [Parameter(Mandatory=$true)][string]$Executable,
+        [Parameter(Mandatory=$true)][string[]]$Arguments,
+        [Parameter(Mandatory=$true)][string]$LogPath,
+        [string]$WorkingDirectory = $runRoot
+    )
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $Executable
+    $psi.WorkingDirectory = $WorkingDirectory
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UserName = $script:candidateUserName
+    $psi.Domain = $env:COMPUTERNAME
+    $psi.Password = $script:candidatePassword
+    $psi.LoadUserProfile = $true
+
+    # Candidate code receives only operating-system and toolchain variables.
+    # No GITHUB_*, ACTIONS_*, RUNNER_*, token, URL, hash, or encryption-key values.
+    $safeEnvironment = @(
+        'PATH','PATHEXT','SystemRoot','WINDIR','SystemDrive','COMPUTERNAME','ProgramFiles','ProgramFiles(x86)','ProgramW6432',
+        'CommonProgramFiles','CommonProgramFiles(x86)','ProgramData','ComSpec',
+        'PROCESSOR_ARCHITECTURE','PROCESSOR_IDENTIFIER','NUMBER_OF_PROCESSORS',
+        'VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsRedistDir',
+        'VisualStudioVersion','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir',
+        'UCRTVersion','INCLUDE','LIB','LIBPATH','VSCMD_VER','VSCMD_ARG_TGT_ARCH',
+        'VSCMD_ARG_HOST_ARCH','DevEnvDir','MSBuildExtensionsPath','MSBuildSDKsPath',
+        'DOTNET_ROOT','DOTNET_ROOT_X64','DOTNET_ROOT_X86'
+    )
+    $psi.Environment.Clear()
+    foreach ($name in $safeEnvironment) {
+        $value = [Environment]::GetEnvironmentVariable($name,'Process')
+        if ($null -ne $value) { $psi.Environment[$name] = $value }
+    }
+    $profileHome = $script:candidateProfile
+    $psi.Environment['USERNAME'] = $script:candidateUserName
+    $psi.Environment['USERDOMAIN'] = $env:COMPUTERNAME
+    $psi.Environment['USERPROFILE'] = $profileHome
+    $psi.Environment['HOME'] = $profileHome
+    $psi.Environment['HOMEDRIVE'] = $env:SystemDrive
+    $psi.Environment['HOMEPATH'] = $profileHome.Substring($env:SystemDrive.Length)
+    $psi.Environment['TEMP'] = $script:candidateTemp
+    $psi.Environment['TMP'] = $script:candidateTemp
+    $psi.Environment['APPDATA'] = Join-Path $profileHome 'AppData/Roaming'
+    $psi.Environment['LOCALAPPDATA'] = Join-Path $profileHome 'AppData/Local'
+    if ($script:pythonDependencyRoot) { $psi.Environment['VALIDATION_PYTHON_DEPENDENCIES'] = $script:pythonDependencyRoot }
+    $psi.Environment['PSModulePath'] = @(
+        (Join-Path $env:ProgramFiles 'PowerShell/Modules'),
+        (Join-Path $env:ProgramFiles 'WindowsPowerShell/Modules'),
+        (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/Modules')
+    ) -join ';'
+
+    foreach ($argument in $Arguments) {
+        [void]$psi.ArgumentList.Add([string]$argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $psi
+    $stdoutTask = $null
+    $stderrTask = $null
+    $processId = 0
+
+    try {
+        if (-not $process.Start()) { throw 'CANDIDATE_PROCESS_START_FAILED' }
+        $processId = $process.Id
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $combined = $stdout + [Environment]::NewLine + '--- STDERR ---' + [Environment]::NewLine + $stderr
+        [System.IO.File]::WriteAllText($LogPath,$combined,[System.Text.UTF8Encoding]::new($false))
+        return [int]$process.ExitCode
+    }
+    finally {
+        if ($processId -gt 0) {
+            Stop-CandidateProcessTree -RootProcessId $processId
+        }
+        $process.Dispose()
+        $psi = $null
+    }
+}
+
+try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+
+    if ([string]::IsNullOrWhiteSpace($sourceUrl)) { throw 'CONFIG_SOURCE_URL_MISSING' }
+    if ($expectedHash -notmatch '^[0-9a-fA-F]{64}$') { throw 'CONFIG_SHA256_INVALID' }
+    if ([string]::IsNullOrWhiteSpace($evidenceKeyB64)) { throw 'CONFIG_EVIDENCE_KEY_MISSING' }
+
+    $keyCheck = [Convert]::FromBase64String($evidenceKeyB64)
+    if ($keyCheck.Length -ne 32) { throw 'CONFIG_EVIDENCE_KEY_LENGTH_INVALID' }
+    [Array]::Clear($keyCheck,0,$keyCheck.Length)
+    $keyCheck = $null
+    $evidenceKeyB64 = $null
+
+    # The signed URL is used only by the bootstrap downloader.
+    Invoke-WebRequest -Uri $sourceUrl -OutFile $archivePath -MaximumRedirection 5 -ErrorAction Stop
+    $sourceUrl = $null
+
+    $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $expectedHash.ToLowerInvariant()) { throw 'SOURCE_SHA256_MISMATCH' }
+    $sourceHashVerified = $true
+    $expectedHash = $null
+
+    Expand-Archive -LiteralPath $archivePath -DestinationPath $payloadRoot -Force
+
+    # Optional wheelhouse metadata is generic and candidate-scoped. All downloads are hash-verified before candidate code is started.
+    Initialize-ValidationDependencyWheelhouse
+
+    # Candidate code runs as a temporary standard user with user-scoped inbound
+    # and outbound network blocks. No checkout token or GitHub credential is used.
+    foreach ($name in $secretEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name,$null,'Process')
+        Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+    }
+    $sourceUrl = $null
+    $expectedHash = $null
+    $evidenceKeyB64 = $null
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    Initialize-CandidateSandbox
+
+    $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+    $egressProbe = '$client = $null; try { $client = [Net.Sockets.TcpClient]::new(); $a = $client.BeginConnect("1.1.1.1",443,$null,$null); if ($a.AsyncWaitHandle.WaitOne(2500) -and $client.Connected) { exit 23 }; exit 0 } catch { exit 0 } finally { if ($client) { $client.Dispose() } }'
+    $probeExit = Invoke-Captured -Executable $pwsh -Arguments @('-NoLogo','-NoProfile','-NonInteractive','-Command',$egressProbe) -LogPath (Join-Path $evidenceRoot 'network-isolation-probe.log')
+    if ($probeExit -ne 0) { throw 'SANDBOX_OUTBOUND_NETWORK_NOT_BLOCKED' }
+
+    if ($Lane -eq '01') {
+        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'Invoke-*-WindowsMSVC.ps1' -File -Recurse)
+        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+
+        $runner = $runnerCandidates[0].FullName
+        $packageRoot = $runnerCandidates[0].Directory.FullName
+        $archiveCandidates = @(Get-ChildItem -LiteralPath $packageRoot -Filter '*_CANDIDATE_*.zip' -File)
+        if ($archiveCandidates.Count -ne 1) { throw 'PACKAGE_INPUT_LAYOUT_INVALID' }
+
+        $exitCode = Invoke-Captured -Executable $pwsh -Arguments @(
+            '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',$runner,'-CandidateArchive',$archiveCandidates[0].FullName,
+            '-EvidenceParent',$candidateOutputRoot,'-Configuration','Release','-Parallel','2'
+        ) -LogPath (Join-Path $evidenceRoot 'candidate-runner.log') -WorkingDirectory $packageRoot
+        Copy-CandidateEvidenceSafely
+
+        if ($exitCode -eq 0) { $status = 'PASS_LANE_01_CANDIDATE_VALIDATION' }
+        else { $status = 'FAIL_LANE_01_CANDIDATE_VALIDATION' }
+    }
+    elseif ($Lane -eq '02') {
+        $cmakeCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'CMakeLists.txt' -File -Recurse |
+            Where-Object {
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'src') -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'include') -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'tests') -PathType Container)
+            })
+        if ($cmakeCandidates.Count -ne 1) { throw 'PACKAGE_BUILD_ROOT_LAYOUT_INVALID' }
+        $sourceRoot = $cmakeCandidates[0].Directory.FullName
+
+        $cmake = (Get-Command cmake.exe -ErrorAction Stop).Source
+        New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
+
+        $exitCode = Invoke-Captured -Executable $cmake -Arguments @(
+            '-S',$sourceRoot,'-B',$buildRoot,
+            '-DBUILD_TESTING=ON',
+            '-DCMAKE_CONFIGURATION_TYPES=Release'
+        ) -LogPath (Join-Path $evidenceRoot 'configure.log')
+        if ($exitCode -ne 0) { throw 'BUILD_CONFIGURE_FAILED' }
+
+        $exitCode = Invoke-Captured -Executable $cmake -Arguments @(
+            '--build',$buildRoot,'--config','Release','--parallel','2','--target','ALL_BUILD'
+        ) -LogPath (Join-Path $evidenceRoot 'build.log')
+        if ($exitCode -ne 0) { throw 'FULL_BUILD_FAILED' }
+
+        $ctest = (Get-Command ctest.exe -ErrorAction Stop).Source
+        $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
+            '--test-dir',$buildRoot,'-C','Release','-N'
+        ) -LogPath (Join-Path $evidenceRoot 'test-discovery.log')
+        if ($exitCode -ne 0) { throw 'TEST_DISCOVERY_FAILED' }
+
+        $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
+            '--test-dir',$buildRoot,'-C','Release','--output-on-failure','--verbose',
+            '--parallel','2','--timeout','300','--output-junit',(Join-Path $candidateOutputRoot 'ctest-junit.xml')
+        ) -LogPath (Join-Path $evidenceRoot 'ctest-execution.log')
+
+        Copy-CandidateEvidenceSafely
+        if ($exitCode -eq 0) { $status = 'PASS_LANE_02_BUILD_AND_TESTS' }
+        else { $status = 'FAIL_LANE_02_BUILD_OR_TESTS' }
+    }
+    else {
+        # Generic Windows-client package contract: exactly one runner under the package
+        # must match run_*_integration_windows.py. No product-specific names are embedded
+        # in this public execution infrastructure.
+        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'run_*_integration_windows.py' -File -Recurse)
+        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+
+        $runner = $runnerCandidates[0].FullName
+        $projectRoot = $runnerCandidates[0].Directory.Parent.FullName
+        $requiredSourceRoot = Join-Path $projectRoot 'source/active'
+        if (!(Test-Path -LiteralPath $requiredSourceRoot -PathType Container)) {
+            throw 'PACKAGE_SOURCE_LAYOUT_INVALID'
+        }
+
+        if ([int]$os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 22000) {
+            $status = 'NOT_RUN_REQUIRED_CLIENT_OS_UNAVAILABLE'
+            $exitCode = 0
+            $platformEvidence = [ordered]@{
+                status = $status
+                os_build = $os.BuildNumber
+                product_type = $os.ProductType
+                required_client_os_proof = $false
+                tests_executed = 0
+                runner_entrypoint_count = 1
+                reason = 'The hosted runner is not a supported Windows client OS; no client-OS security tests were executed.'
+            }
+            $platformEvidence | ConvertTo-Json -Depth 5 |
+                Set-Content -LiteralPath (Join-Path $evidenceRoot 'platform-limit.json') -Encoding utf8
+        }
+        else {
+            $python = (Get-Command python.exe -ErrorAction Stop).Source
+            $runnerOutput = Join-Path $candidateOutputRoot 'windows-client'
+            New-Item -ItemType Directory -Path $runnerOutput -Force | Out-Null
+            $runnerLog = Join-Path $evidenceRoot 'windows-client-launch.log'
+            $runnerExit = Invoke-Captured -Executable $python -Arguments @(
+                $runner,'--project-root',$projectRoot,'--output-dir',$runnerOutput
+            ) -LogPath $runnerLog -WorkingDirectory $projectRoot
+
+            $runnerStatus = 'RESULT_UNAVAILABLE'
+            $testCounts = $null
+            $resultPath = Join-Path $runnerOutput 'WINDOWS_LIFECYCLE_RESULT.json'
+            if ((Test-Path -LiteralPath $resultPath -PathType Leaf) -and (Get-Item -LiteralPath $resultPath).Length -le 5MB) {
+                try {
+                    $runnerDocument = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                    if ($runnerDocument.status -is [string] -and $runnerDocument.status -match '^[A-Z0-9_]+$') {
+                        $runnerStatus = $runnerDocument.status
+                    }
+                    $testCounts = [ordered]@{
+                        total = [int]$runnerDocument.tests.total
+                        passed = [int]$runnerDocument.tests.passed
+                        skipped = [int]$runnerDocument.tests.skipped
+                        failures = [int]$runnerDocument.tests.failures
+                        errors = [int]$runnerDocument.tests.errors
+                    }
+                } catch {
+                    $runnerStatus = 'RESULT_PARSE_FAILED'
+                }
+            }
+
+            Copy-CandidateEvidenceSafely
+            $summary = [ordered]@{
+                schema = 'validation.gateway.windows_client_result.v1'
+                runner_status = $runnerStatus
+                runner_exit_code = [int]$runnerExit
+                test_counts = $testCounts
+                windows_client_gate = $true
+                runner_os_label = 'windows-2025'
+            }
+            $summary | ConvertTo-Json -Depth 8 |
+                Set-Content -LiteralPath (Join-Path $evidenceRoot 'runner-summary.json') -Encoding utf8
+
+            if ($runnerExit -eq 0 -and $runnerStatus -eq 'PASS_WINDOWS11_STANDARD_USER' -and
+                $null -ne $testCounts -and $testCounts.total -gt 0 -and
+                $testCounts.skipped -eq 0 -and $testCounts.failures -eq 0 -and $testCounts.errors -eq 0) {
+                $status = 'PASS_LANE_03_WINDOWS_CLIENT_VALIDATION'
+                $exitCode = 0
+            } else {
+                $status = 'FAIL_OR_PARTIAL_LANE_03_PLATFORM_VALIDATION'
+                $exitCode = 1
+            }
+        }
+    }
+}
+catch {
+    $safeCode = [string]$_.Exception.Message
+    if ($safeCode -notmatch '^[A-Z0-9_]+$') { $safeCode = 'EXECUTION_ERROR' }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $evidenceRoot 'failure-code.txt'),
+        $safeCode,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    if ($status -eq 'BLOCKED') { $status = 'BLOCKED_OR_FAILED' }
+    if ($exitCode -eq 0 -and $status -ne 'NOT_RUN_REQUIRED_CLIENT_OS_UNAVAILABLE') { $exitCode = 1 }
+}
+finally {
+    foreach ($name in $secretEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name,$null,'Process')
+        Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+    }
+    $sourceUrl = $null
+    $expectedHash = $null
+    $evidenceKeyB64 = $null
+    Remove-CandidateSandbox
+
+    $final = [ordered]@{
+        schema = 'validation.gateway.execution.v2'
+        lane = $Lane
+        status = $status
+        exit_code = $exitCode
+        source_sha256_actual = $actualHash
+        source_sha256_verified = $sourceHashVerified
+        operating_system = if ($os) { $os.Caption } else { 'UNKNOWN' }
+        os_build = if ($os) { $os.BuildNumber } else { 'UNKNOWN' }
+        os_product_type = if ($os) { $os.ProductType } else { 'UNKNOWN' }
+        required_client_os_proof = ($null -ne $os -and [int]$os.ProductType -eq 1 -and [int]$os.BuildNumber -ge 22000)
+        runner_label = 'windows-2025'
+        candidate_secret_environment_variables_removed = $true
+        started_utc = $startedUtc
+        completed_utc = [DateTime]::UtcNow.ToString('o')
+    }
+    $final | ConvertTo-Json -Depth 8 |
+        Set-Content -LiteralPath (Join-Path $evidenceRoot 'execution-result.json') -Encoding utf8
+    if ($stepOutputPath) { Add-Content -LiteralPath $stepOutputPath -Value ("status={0}" -f $status) }
+}
+
+if ($exitCode -ne 0) { exit 1 }
+exit 0
+) { throw 'INVALID_LOCK_PATH' }
+        if ($manifest.lock_file_sha256 -notmatch '^[0-9a-f]{64}    foreach ($ruleName in $script:firewallRuleNames) {
+        Remove-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+    }
+    $script:firewallRuleNames = @()
+    if ($script:candidateUserName) {
+        Remove-LocalUser -Name $script:candidateUserName -ErrorAction SilentlyContinue
+    }
+    if ($script:candidatePassword) {
+        $script:candidatePassword.Dispose()
+        $script:candidatePassword = $null
+    }
+}
+
+function Invoke-Captured {
+    param(
+        [Parameter(Mandatory=$true)][string]$Executable,
+        [Parameter(Mandatory=$true)][string[]]$Arguments,
+        [Parameter(Mandatory=$true)][string]$LogPath,
+        [string]$WorkingDirectory = $runRoot
+    )
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $Executable
+    $psi.WorkingDirectory = $WorkingDirectory
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UserName = $script:candidateUserName
+    $psi.Domain = $env:COMPUTERNAME
+    $psi.Password = $script:candidatePassword
+    $psi.LoadUserProfile = $true
+
+    # Candidate code receives only operating-system and toolchain variables.
+    # No GITHUB_*, ACTIONS_*, RUNNER_*, token, URL, hash, or encryption-key values.
+    $safeEnvironment = @(
+        'PATH','PATHEXT','SystemRoot','WINDIR','SystemDrive','COMPUTERNAME','ProgramFiles','ProgramFiles(x86)','ProgramW6432',
+        'CommonProgramFiles','CommonProgramFiles(x86)','ProgramData','ComSpec',
+        'PROCESSOR_ARCHITECTURE','PROCESSOR_IDENTIFIER','NUMBER_OF_PROCESSORS',
+        'VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsRedistDir',
+        'VisualStudioVersion','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir',
+        'UCRTVersion','INCLUDE','LIB','LIBPATH','VSCMD_VER','VSCMD_ARG_TGT_ARCH',
+        'VSCMD_ARG_HOST_ARCH','DevEnvDir','MSBuildExtensionsPath','MSBuildSDKsPath',
+        'DOTNET_ROOT','DOTNET_ROOT_X64','DOTNET_ROOT_X86'
+    )
+    $psi.Environment.Clear()
+    foreach ($name in $safeEnvironment) {
+        $value = [Environment]::GetEnvironmentVariable($name,'Process')
+        if ($null -ne $value) { $psi.Environment[$name] = $value }
+    }
+    $profileHome = $script:candidateProfile
+    $psi.Environment['USERNAME'] = $script:candidateUserName
+    $psi.Environment['USERDOMAIN'] = $env:COMPUTERNAME
+    $psi.Environment['USERPROFILE'] = $profileHome
+    $psi.Environment['HOME'] = $profileHome
+    $psi.Environment['HOMEDRIVE'] = $env:SystemDrive
+    $psi.Environment['HOMEPATH'] = $profileHome.Substring($env:SystemDrive.Length)
+    $psi.Environment['TEMP'] = $script:candidateTemp
+    $psi.Environment['TMP'] = $script:candidateTemp
+    $psi.Environment['APPDATA'] = Join-Path $profileHome 'AppData/Roaming'
+    $psi.Environment['LOCALAPPDATA'] = Join-Path $profileHome 'AppData/Local'
+    if ($script:pythonDependencyRoot) { $psi.Environment['VALIDATION_PYTHON_DEPENDENCIES'] = $script:pythonDependencyRoot }
+    $psi.Environment['PSModulePath'] = @(
+        (Join-Path $env:ProgramFiles 'PowerShell/Modules'),
+        (Join-Path $env:ProgramFiles 'WindowsPowerShell/Modules'),
+        (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/Modules')
+    ) -join ';'
+
+    foreach ($argument in $Arguments) {
+        [void]$psi.ArgumentList.Add([string]$argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $psi
+    $stdoutTask = $null
+    $stderrTask = $null
+    $processId = 0
+
+    try {
+        if (-not $process.Start()) { throw 'CANDIDATE_PROCESS_START_FAILED' }
+        $processId = $process.Id
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $combined = $stdout + [Environment]::NewLine + '--- STDERR ---' + [Environment]::NewLine + $stderr
+        [System.IO.File]::WriteAllText($LogPath,$combined,[System.Text.UTF8Encoding]::new($false))
+        return [int]$process.ExitCode
+    }
+    finally {
+        if ($processId -gt 0) {
+            Stop-CandidateProcessTree -RootProcessId $processId
+        }
+        $process.Dispose()
+        $psi = $null
+    }
+}
+
+try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+
+    if ([string]::IsNullOrWhiteSpace($sourceUrl)) { throw 'CONFIG_SOURCE_URL_MISSING' }
+    if ($expectedHash -notmatch '^[0-9a-fA-F]{64}$') { throw 'CONFIG_SHA256_INVALID' }
+    if ([string]::IsNullOrWhiteSpace($evidenceKeyB64)) { throw 'CONFIG_EVIDENCE_KEY_MISSING' }
+
+    $keyCheck = [Convert]::FromBase64String($evidenceKeyB64)
+    if ($keyCheck.Length -ne 32) { throw 'CONFIG_EVIDENCE_KEY_LENGTH_INVALID' }
+    [Array]::Clear($keyCheck,0,$keyCheck.Length)
+    $keyCheck = $null
+    $evidenceKeyB64 = $null
+
+    # The signed URL is used only by the bootstrap downloader.
+    Invoke-WebRequest -Uri $sourceUrl -OutFile $archivePath -MaximumRedirection 5 -ErrorAction Stop
+    $sourceUrl = $null
+
+    $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $expectedHash.ToLowerInvariant()) { throw 'SOURCE_SHA256_MISMATCH' }
+    $sourceHashVerified = $true
+    $expectedHash = $null
+
+    Expand-Archive -LiteralPath $archivePath -DestinationPath $payloadRoot -Force
+
+    # Candidate code runs as a temporary standard user with user-scoped inbound
+    # and outbound network blocks. No checkout token or GitHub credential is used.
+    foreach ($name in $secretEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name,$null,'Process')
+        Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+    }
+    $sourceUrl = $null
+    $expectedHash = $null
+    $evidenceKeyB64 = $null
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    Initialize-CandidateSandbox
+
+    $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+    $egressProbe = '$client = $null; try { $client = [Net.Sockets.TcpClient]::new(); $a = $client.BeginConnect("1.1.1.1",443,$null,$null); if ($a.AsyncWaitHandle.WaitOne(2500) -and $client.Connected) { exit 23 }; exit 0 } catch { exit 0 } finally { if ($client) { $client.Dispose() } }'
+    $probeExit = Invoke-Captured -Executable $pwsh -Arguments @('-NoLogo','-NoProfile','-NonInteractive','-Command',$egressProbe) -LogPath (Join-Path $evidenceRoot 'network-isolation-probe.log')
+    if ($probeExit -ne 0) { throw 'SANDBOX_OUTBOUND_NETWORK_NOT_BLOCKED' }
+
+    if ($Lane -eq '01') {
+        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'Invoke-*-WindowsMSVC.ps1' -File -Recurse)
+        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+
+        $runner = $runnerCandidates[0].FullName
+        $packageRoot = $runnerCandidates[0].Directory.FullName
+        $archiveCandidates = @(Get-ChildItem -LiteralPath $packageRoot -Filter '*_CANDIDATE_*.zip' -File)
+        if ($archiveCandidates.Count -ne 1) { throw 'PACKAGE_INPUT_LAYOUT_INVALID' }
+
+        $exitCode = Invoke-Captured -Executable $pwsh -Arguments @(
+            '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',$runner,'-CandidateArchive',$archiveCandidates[0].FullName,
+            '-EvidenceParent',$candidateOutputRoot,'-Configuration','Release','-Parallel','2'
+        ) -LogPath (Join-Path $evidenceRoot 'candidate-runner.log') -WorkingDirectory $packageRoot
+        Copy-CandidateEvidenceSafely
+
+        if ($exitCode -eq 0) { $status = 'PASS_LANE_01_CANDIDATE_VALIDATION' }
+        else { $status = 'FAIL_LANE_01_CANDIDATE_VALIDATION' }
+    }
+    elseif ($Lane -eq '02') {
+        $cmakeCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'CMakeLists.txt' -File -Recurse |
+            Where-Object {
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'src') -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'include') -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'tests') -PathType Container)
+            })
+        if ($cmakeCandidates.Count -ne 1) { throw 'PACKAGE_BUILD_ROOT_LAYOUT_INVALID' }
+        $sourceRoot = $cmakeCandidates[0].Directory.FullName
+
+        $cmake = (Get-Command cmake.exe -ErrorAction Stop).Source
+        New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
+
+        $exitCode = Invoke-Captured -Executable $cmake -Arguments @(
+            '-S',$sourceRoot,'-B',$buildRoot,
+            '-DBUILD_TESTING=ON',
+            '-DCMAKE_CONFIGURATION_TYPES=Release'
+        ) -LogPath (Join-Path $evidenceRoot 'configure.log')
+        if ($exitCode -ne 0) { throw 'BUILD_CONFIGURE_FAILED' }
+
+        $exitCode = Invoke-Captured -Executable $cmake -Arguments @(
+            '--build',$buildRoot,'--config','Release','--parallel','2','--target','ALL_BUILD'
+        ) -LogPath (Join-Path $evidenceRoot 'build.log')
+        if ($exitCode -ne 0) { throw 'FULL_BUILD_FAILED' }
+
+        $ctest = (Get-Command ctest.exe -ErrorAction Stop).Source
+        $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
+            '--test-dir',$buildRoot,'-C','Release','-N'
+        ) -LogPath (Join-Path $evidenceRoot 'test-discovery.log')
+        if ($exitCode -ne 0) { throw 'TEST_DISCOVERY_FAILED' }
+
+        $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
+            '--test-dir',$buildRoot,'-C','Release','--output-on-failure','--verbose',
+            '--parallel','2','--timeout','300','--output-junit',(Join-Path $candidateOutputRoot 'ctest-junit.xml')
+        ) -LogPath (Join-Path $evidenceRoot 'ctest-execution.log')
+
+        Copy-CandidateEvidenceSafely
+        if ($exitCode -eq 0) { $status = 'PASS_LANE_02_BUILD_AND_TESTS' }
+        else { $status = 'FAIL_LANE_02_BUILD_OR_TESTS' }
+    }
+    else {
+        # Generic Windows-client package contract: exactly one runner under the package
+        # must match run_*_integration_windows.py. No product-specific names are embedded
+        # in this public execution infrastructure.
+        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'run_*_integration_windows.py' -File -Recurse)
+        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+
+        $runner = $runnerCandidates[0].FullName
+        $projectRoot = $runnerCandidates[0].Directory.Parent.FullName
+        $requiredSourceRoot = Join-Path $projectRoot 'source/active'
+        if (!(Test-Path -LiteralPath $requiredSourceRoot -PathType Container)) {
+            throw 'PACKAGE_SOURCE_LAYOUT_INVALID'
+        }
+
+        if ([int]$os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 22000) {
+            $status = 'NOT_RUN_REQUIRED_CLIENT_OS_UNAVAILABLE'
+            $exitCode = 0
+            $platformEvidence = [ordered]@{
+                status = $status
+                os_build = $os.BuildNumber
+                product_type = $os.ProductType
+                required_client_os_proof = $false
+                tests_executed = 0
+                runner_entrypoint_count = 1
+                reason = 'The hosted runner is not a supported Windows client OS; no client-OS security tests were executed.'
+            }
+            $platformEvidence | ConvertTo-Json -Depth 5 |
+                Set-Content -LiteralPath (Join-Path $evidenceRoot 'platform-limit.json') -Encoding utf8
+        }
+        else {
+            $python = (Get-Command python.exe -ErrorAction Stop).Source
+            $runnerOutput = Join-Path $candidateOutputRoot 'windows-client'
+            New-Item -ItemType Directory -Path $runnerOutput -Force | Out-Null
+            $runnerLog = Join-Path $evidenceRoot 'windows-client-launch.log'
+            $runnerExit = Invoke-Captured -Executable $python -Arguments @(
+                $runner,'--project-root',$projectRoot,'--output-dir',$runnerOutput
+            ) -LogPath $runnerLog -WorkingDirectory $projectRoot
+
+            $runnerStatus = 'RESULT_UNAVAILABLE'
+            $testCounts = $null
+            $resultPath = Join-Path $runnerOutput 'WINDOWS_LIFECYCLE_RESULT.json'
+            if ((Test-Path -LiteralPath $resultPath -PathType Leaf) -and (Get-Item -LiteralPath $resultPath).Length -le 5MB) {
+                try {
+                    $runnerDocument = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                    if ($runnerDocument.status -is [string] -and $runnerDocument.status -match '^[A-Z0-9_]+$') {
+                        $runnerStatus = $runnerDocument.status
+                    }
+                    $testCounts = [ordered]@{
+                        total = [int]$runnerDocument.tests.total
+                        passed = [int]$runnerDocument.tests.passed
+                        skipped = [int]$runnerDocument.tests.skipped
+                        failures = [int]$runnerDocument.tests.failures
+                        errors = [int]$runnerDocument.tests.errors
+                    }
+                } catch {
+                    $runnerStatus = 'RESULT_PARSE_FAILED'
+                }
+            }
+
+            Copy-CandidateEvidenceSafely
+            $summary = [ordered]@{
+                schema = 'validation.gateway.windows_client_result.v1'
+                runner_status = $runnerStatus
+                runner_exit_code = [int]$runnerExit
+                test_counts = $testCounts
+                windows_client_gate = $true
+                runner_os_label = 'windows-2025'
+            }
+            $summary | ConvertTo-Json -Depth 8 |
+                Set-Content -LiteralPath (Join-Path $evidenceRoot 'runner-summary.json') -Encoding utf8
+
+            if ($runnerExit -eq 0 -and $runnerStatus -eq 'PASS_WINDOWS11_STANDARD_USER' -and
+                $null -ne $testCounts -and $testCounts.total -gt 0 -and
+                $testCounts.skipped -eq 0 -and $testCounts.failures -eq 0 -and $testCounts.errors -eq 0) {
+                $status = 'PASS_LANE_03_WINDOWS_CLIENT_VALIDATION'
+                $exitCode = 0
+            } else {
+                $status = 'FAIL_OR_PARTIAL_LANE_03_PLATFORM_VALIDATION'
+                $exitCode = 1
+            }
+        }
+    }
+}
+catch {
+    $safeCode = [string]$_.Exception.Message
+    if ($safeCode -notmatch '^[A-Z0-9_]+$') { $safeCode = 'EXECUTION_ERROR' }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $evidenceRoot 'failure-code.txt'),
+        $safeCode,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    if ($status -eq 'BLOCKED') { $status = 'BLOCKED_OR_FAILED' }
+    if ($exitCode -eq 0 -and $status -ne 'NOT_RUN_REQUIRED_CLIENT_OS_UNAVAILABLE') { $exitCode = 1 }
+}
+finally {
+    foreach ($name in $secretEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name,$null,'Process')
+        Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+    }
+    $sourceUrl = $null
+    $expectedHash = $null
+    $evidenceKeyB64 = $null
+    Remove-CandidateSandbox
+
+    $final = [ordered]@{
+        schema = 'validation.gateway.execution.v2'
+        lane = $Lane
+        status = $status
+        exit_code = $exitCode
+        source_sha256_actual = $actualHash
+        source_sha256_verified = $sourceHashVerified
+        operating_system = if ($os) { $os.Caption } else { 'UNKNOWN' }
+        os_build = if ($os) { $os.BuildNumber } else { 'UNKNOWN' }
+        os_product_type = if ($os) { $os.ProductType } else { 'UNKNOWN' }
+        required_client_os_proof = ($null -ne $os -and [int]$os.ProductType -eq 1 -and [int]$os.BuildNumber -ge 22000)
+        runner_label = 'windows-2025'
+        candidate_secret_environment_variables_removed = $true
+        started_utc = $startedUtc
+        completed_utc = [DateTime]::UtcNow.ToString('o')
+    }
+    $final | ConvertTo-Json -Depth 8 |
+        Set-Content -LiteralPath (Join-Path $evidenceRoot 'execution-result.json') -Encoding utf8
+    if ($stepOutputPath) { Add-Content -LiteralPath $stepOutputPath -Value ("status={0}" -f $status) }
+}
+
+if ($exitCode -ne 0) { exit 1 }
+exit 0
+) { throw 'INVALID_LOCK_HASH' }
+
+        $lockPath = Join-Path $manifestDirectory $manifest.lock_file
+        if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { throw 'LOCK_FILE_MISSING' }
+        $lockHash = (Get-FileHash -LiteralPath $lockPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($lockHash -ne $manifest.lock_file_sha256) { throw 'LOCK_HASH_MISMATCH' }
+
+        $totalBytes = [int64]0
+        $seenNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($artifact in $manifest.artifacts) {
+            if ($artifact.filename -notmatch '^[A-Za-z0-9_.+-]+\.whl    foreach ($ruleName in $script:firewallRuleNames) {
+        Remove-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+    }
+    $script:firewallRuleNames = @()
+    if ($script:candidateUserName) {
+        Remove-LocalUser -Name $script:candidateUserName -ErrorAction SilentlyContinue
+    }
+    if ($script:candidatePassword) {
+        $script:candidatePassword.Dispose()
+        $script:candidatePassword = $null
+    }
+}
+
+function Invoke-Captured {
+    param(
+        [Parameter(Mandatory=$true)][string]$Executable,
+        [Parameter(Mandatory=$true)][string[]]$Arguments,
+        [Parameter(Mandatory=$true)][string]$LogPath,
+        [string]$WorkingDirectory = $runRoot
+    )
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $Executable
+    $psi.WorkingDirectory = $WorkingDirectory
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UserName = $script:candidateUserName
+    $psi.Domain = $env:COMPUTERNAME
+    $psi.Password = $script:candidatePassword
+    $psi.LoadUserProfile = $true
+
+    # Candidate code receives only operating-system and toolchain variables.
+    # No GITHUB_*, ACTIONS_*, RUNNER_*, token, URL, hash, or encryption-key values.
+    $safeEnvironment = @(
+        'PATH','PATHEXT','SystemRoot','WINDIR','SystemDrive','COMPUTERNAME','ProgramFiles','ProgramFiles(x86)','ProgramW6432',
+        'CommonProgramFiles','CommonProgramFiles(x86)','ProgramData','ComSpec',
+        'PROCESSOR_ARCHITECTURE','PROCESSOR_IDENTIFIER','NUMBER_OF_PROCESSORS',
+        'VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsRedistDir',
+        'VisualStudioVersion','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir',
+        'UCRTVersion','INCLUDE','LIB','LIBPATH','VSCMD_VER','VSCMD_ARG_TGT_ARCH',
+        'VSCMD_ARG_HOST_ARCH','DevEnvDir','MSBuildExtensionsPath','MSBuildSDKsPath',
+        'DOTNET_ROOT','DOTNET_ROOT_X64','DOTNET_ROOT_X86'
+    )
+    $psi.Environment.Clear()
+    foreach ($name in $safeEnvironment) {
+        $value = [Environment]::GetEnvironmentVariable($name,'Process')
+        if ($null -ne $value) { $psi.Environment[$name] = $value }
+    }
+    $profileHome = $script:candidateProfile
+    $psi.Environment['USERNAME'] = $script:candidateUserName
+    $psi.Environment['USERDOMAIN'] = $env:COMPUTERNAME
+    $psi.Environment['USERPROFILE'] = $profileHome
+    $psi.Environment['HOME'] = $profileHome
+    $psi.Environment['HOMEDRIVE'] = $env:SystemDrive
+    $psi.Environment['HOMEPATH'] = $profileHome.Substring($env:SystemDrive.Length)
+    $psi.Environment['TEMP'] = $script:candidateTemp
+    $psi.Environment['TMP'] = $script:candidateTemp
+    $psi.Environment['APPDATA'] = Join-Path $profileHome 'AppData/Roaming'
+    $psi.Environment['LOCALAPPDATA'] = Join-Path $profileHome 'AppData/Local'
+    if ($script:pythonDependencyRoot) { $psi.Environment['VALIDATION_PYTHON_DEPENDENCIES'] = $script:pythonDependencyRoot }
+    $psi.Environment['PSModulePath'] = @(
+        (Join-Path $env:ProgramFiles 'PowerShell/Modules'),
+        (Join-Path $env:ProgramFiles 'WindowsPowerShell/Modules'),
+        (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/Modules')
+    ) -join ';'
+
+    foreach ($argument in $Arguments) {
+        [void]$psi.ArgumentList.Add([string]$argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $psi
+    $stdoutTask = $null
+    $stderrTask = $null
+    $processId = 0
+
+    try {
+        if (-not $process.Start()) { throw 'CANDIDATE_PROCESS_START_FAILED' }
+        $processId = $process.Id
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $combined = $stdout + [Environment]::NewLine + '--- STDERR ---' + [Environment]::NewLine + $stderr
+        [System.IO.File]::WriteAllText($LogPath,$combined,[System.Text.UTF8Encoding]::new($false))
+        return [int]$process.ExitCode
+    }
+    finally {
+        if ($processId -gt 0) {
+            Stop-CandidateProcessTree -RootProcessId $processId
+        }
+        $process.Dispose()
+        $psi = $null
+    }
+}
+
+try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+
+    if ([string]::IsNullOrWhiteSpace($sourceUrl)) { throw 'CONFIG_SOURCE_URL_MISSING' }
+    if ($expectedHash -notmatch '^[0-9a-fA-F]{64}$') { throw 'CONFIG_SHA256_INVALID' }
+    if ([string]::IsNullOrWhiteSpace($evidenceKeyB64)) { throw 'CONFIG_EVIDENCE_KEY_MISSING' }
+
+    $keyCheck = [Convert]::FromBase64String($evidenceKeyB64)
+    if ($keyCheck.Length -ne 32) { throw 'CONFIG_EVIDENCE_KEY_LENGTH_INVALID' }
+    [Array]::Clear($keyCheck,0,$keyCheck.Length)
+    $keyCheck = $null
+    $evidenceKeyB64 = $null
+
+    # The signed URL is used only by the bootstrap downloader.
+    Invoke-WebRequest -Uri $sourceUrl -OutFile $archivePath -MaximumRedirection 5 -ErrorAction Stop
+    $sourceUrl = $null
+
+    $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $expectedHash.ToLowerInvariant()) { throw 'SOURCE_SHA256_MISMATCH' }
+    $sourceHashVerified = $true
+    $expectedHash = $null
+
+    Expand-Archive -LiteralPath $archivePath -DestinationPath $payloadRoot -Force
+
+    # Candidate code runs as a temporary standard user with user-scoped inbound
+    # and outbound network blocks. No checkout token or GitHub credential is used.
+    foreach ($name in $secretEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name,$null,'Process')
+        Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+    }
+    $sourceUrl = $null
+    $expectedHash = $null
+    $evidenceKeyB64 = $null
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    Initialize-CandidateSandbox
+
+    $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+    $egressProbe = '$client = $null; try { $client = [Net.Sockets.TcpClient]::new(); $a = $client.BeginConnect("1.1.1.1",443,$null,$null); if ($a.AsyncWaitHandle.WaitOne(2500) -and $client.Connected) { exit 23 }; exit 0 } catch { exit 0 } finally { if ($client) { $client.Dispose() } }'
+    $probeExit = Invoke-Captured -Executable $pwsh -Arguments @('-NoLogo','-NoProfile','-NonInteractive','-Command',$egressProbe) -LogPath (Join-Path $evidenceRoot 'network-isolation-probe.log')
+    if ($probeExit -ne 0) { throw 'SANDBOX_OUTBOUND_NETWORK_NOT_BLOCKED' }
+
+    if ($Lane -eq '01') {
+        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'Invoke-*-WindowsMSVC.ps1' -File -Recurse)
+        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+
+        $runner = $runnerCandidates[0].FullName
+        $packageRoot = $runnerCandidates[0].Directory.FullName
+        $archiveCandidates = @(Get-ChildItem -LiteralPath $packageRoot -Filter '*_CANDIDATE_*.zip' -File)
+        if ($archiveCandidates.Count -ne 1) { throw 'PACKAGE_INPUT_LAYOUT_INVALID' }
+
+        $exitCode = Invoke-Captured -Executable $pwsh -Arguments @(
+            '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',$runner,'-CandidateArchive',$archiveCandidates[0].FullName,
+            '-EvidenceParent',$candidateOutputRoot,'-Configuration','Release','-Parallel','2'
+        ) -LogPath (Join-Path $evidenceRoot 'candidate-runner.log') -WorkingDirectory $packageRoot
+        Copy-CandidateEvidenceSafely
+
+        if ($exitCode -eq 0) { $status = 'PASS_LANE_01_CANDIDATE_VALIDATION' }
+        else { $status = 'FAIL_LANE_01_CANDIDATE_VALIDATION' }
+    }
+    elseif ($Lane -eq '02') {
+        $cmakeCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'CMakeLists.txt' -File -Recurse |
+            Where-Object {
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'src') -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'include') -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'tests') -PathType Container)
+            })
+        if ($cmakeCandidates.Count -ne 1) { throw 'PACKAGE_BUILD_ROOT_LAYOUT_INVALID' }
+        $sourceRoot = $cmakeCandidates[0].Directory.FullName
+
+        $cmake = (Get-Command cmake.exe -ErrorAction Stop).Source
+        New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
+
+        $exitCode = Invoke-Captured -Executable $cmake -Arguments @(
+            '-S',$sourceRoot,'-B',$buildRoot,
+            '-DBUILD_TESTING=ON',
+            '-DCMAKE_CONFIGURATION_TYPES=Release'
+        ) -LogPath (Join-Path $evidenceRoot 'configure.log')
+        if ($exitCode -ne 0) { throw 'BUILD_CONFIGURE_FAILED' }
+
+        $exitCode = Invoke-Captured -Executable $cmake -Arguments @(
+            '--build',$buildRoot,'--config','Release','--parallel','2','--target','ALL_BUILD'
+        ) -LogPath (Join-Path $evidenceRoot 'build.log')
+        if ($exitCode -ne 0) { throw 'FULL_BUILD_FAILED' }
+
+        $ctest = (Get-Command ctest.exe -ErrorAction Stop).Source
+        $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
+            '--test-dir',$buildRoot,'-C','Release','-N'
+        ) -LogPath (Join-Path $evidenceRoot 'test-discovery.log')
+        if ($exitCode -ne 0) { throw 'TEST_DISCOVERY_FAILED' }
+
+        $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
+            '--test-dir',$buildRoot,'-C','Release','--output-on-failure','--verbose',
+            '--parallel','2','--timeout','300','--output-junit',(Join-Path $candidateOutputRoot 'ctest-junit.xml')
+        ) -LogPath (Join-Path $evidenceRoot 'ctest-execution.log')
+
+        Copy-CandidateEvidenceSafely
+        if ($exitCode -eq 0) { $status = 'PASS_LANE_02_BUILD_AND_TESTS' }
+        else { $status = 'FAIL_LANE_02_BUILD_OR_TESTS' }
+    }
+    else {
+        # Generic Windows-client package contract: exactly one runner under the package
+        # must match run_*_integration_windows.py. No product-specific names are embedded
+        # in this public execution infrastructure.
+        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'run_*_integration_windows.py' -File -Recurse)
+        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+
+        $runner = $runnerCandidates[0].FullName
+        $projectRoot = $runnerCandidates[0].Directory.Parent.FullName
+        $requiredSourceRoot = Join-Path $projectRoot 'source/active'
+        if (!(Test-Path -LiteralPath $requiredSourceRoot -PathType Container)) {
+            throw 'PACKAGE_SOURCE_LAYOUT_INVALID'
+        }
+
+        if ([int]$os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 22000) {
+            $status = 'NOT_RUN_REQUIRED_CLIENT_OS_UNAVAILABLE'
+            $exitCode = 0
+            $platformEvidence = [ordered]@{
+                status = $status
+                os_build = $os.BuildNumber
+                product_type = $os.ProductType
+                required_client_os_proof = $false
+                tests_executed = 0
+                runner_entrypoint_count = 1
+                reason = 'The hosted runner is not a supported Windows client OS; no client-OS security tests were executed.'
+            }
+            $platformEvidence | ConvertTo-Json -Depth 5 |
+                Set-Content -LiteralPath (Join-Path $evidenceRoot 'platform-limit.json') -Encoding utf8
+        }
+        else {
+            $python = (Get-Command python.exe -ErrorAction Stop).Source
+            $runnerOutput = Join-Path $candidateOutputRoot 'windows-client'
+            New-Item -ItemType Directory -Path $runnerOutput -Force | Out-Null
+            $runnerLog = Join-Path $evidenceRoot 'windows-client-launch.log'
+            $runnerExit = Invoke-Captured -Executable $python -Arguments @(
+                $runner,'--project-root',$projectRoot,'--output-dir',$runnerOutput
+            ) -LogPath $runnerLog -WorkingDirectory $projectRoot
+
+            $runnerStatus = 'RESULT_UNAVAILABLE'
+            $testCounts = $null
+            $resultPath = Join-Path $runnerOutput 'WINDOWS_LIFECYCLE_RESULT.json'
+            if ((Test-Path -LiteralPath $resultPath -PathType Leaf) -and (Get-Item -LiteralPath $resultPath).Length -le 5MB) {
+                try {
+                    $runnerDocument = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                    if ($runnerDocument.status -is [string] -and $runnerDocument.status -match '^[A-Z0-9_]+$') {
+                        $runnerStatus = $runnerDocument.status
+                    }
+                    $testCounts = [ordered]@{
+                        total = [int]$runnerDocument.tests.total
+                        passed = [int]$runnerDocument.tests.passed
+                        skipped = [int]$runnerDocument.tests.skipped
+                        failures = [int]$runnerDocument.tests.failures
+                        errors = [int]$runnerDocument.tests.errors
+                    }
+                } catch {
+                    $runnerStatus = 'RESULT_PARSE_FAILED'
+                }
+            }
+
+            Copy-CandidateEvidenceSafely
+            $summary = [ordered]@{
+                schema = 'validation.gateway.windows_client_result.v1'
+                runner_status = $runnerStatus
+                runner_exit_code = [int]$runnerExit
+                test_counts = $testCounts
+                windows_client_gate = $true
+                runner_os_label = 'windows-2025'
+            }
+            $summary | ConvertTo-Json -Depth 8 |
+                Set-Content -LiteralPath (Join-Path $evidenceRoot 'runner-summary.json') -Encoding utf8
+
+            if ($runnerExit -eq 0 -and $runnerStatus -eq 'PASS_WINDOWS11_STANDARD_USER' -and
+                $null -ne $testCounts -and $testCounts.total -gt 0 -and
+                $testCounts.skipped -eq 0 -and $testCounts.failures -eq 0 -and $testCounts.errors -eq 0) {
+                $status = 'PASS_LANE_03_WINDOWS_CLIENT_VALIDATION'
+                $exitCode = 0
+            } else {
+                $status = 'FAIL_OR_PARTIAL_LANE_03_PLATFORM_VALIDATION'
+                $exitCode = 1
+            }
+        }
+    }
+}
+catch {
+    $safeCode = [string]$_.Exception.Message
+    if ($safeCode -notmatch '^[A-Z0-9_]+$') { $safeCode = 'EXECUTION_ERROR' }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $evidenceRoot 'failure-code.txt'),
+        $safeCode,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    if ($status -eq 'BLOCKED') { $status = 'BLOCKED_OR_FAILED' }
+    if ($exitCode -eq 0 -and $status -ne 'NOT_RUN_REQUIRED_CLIENT_OS_UNAVAILABLE') { $exitCode = 1 }
+}
+finally {
+    foreach ($name in $secretEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name,$null,'Process')
+        Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+    }
+    $sourceUrl = $null
+    $expectedHash = $null
+    $evidenceKeyB64 = $null
+    Remove-CandidateSandbox
+
+    $final = [ordered]@{
+        schema = 'validation.gateway.execution.v2'
+        lane = $Lane
+        status = $status
+        exit_code = $exitCode
+        source_sha256_actual = $actualHash
+        source_sha256_verified = $sourceHashVerified
+        operating_system = if ($os) { $os.Caption } else { 'UNKNOWN' }
+        os_build = if ($os) { $os.BuildNumber } else { 'UNKNOWN' }
+        os_product_type = if ($os) { $os.ProductType } else { 'UNKNOWN' }
+        required_client_os_proof = ($null -ne $os -and [int]$os.ProductType -eq 1 -and [int]$os.BuildNumber -ge 22000)
+        runner_label = 'windows-2025'
+        candidate_secret_environment_variables_removed = $true
+        started_utc = $startedUtc
+        completed_utc = [DateTime]::UtcNow.ToString('o')
+    }
+    $final | ConvertTo-Json -Depth 8 |
+        Set-Content -LiteralPath (Join-Path $evidenceRoot 'execution-result.json') -Encoding utf8
+    if ($stepOutputPath) { Add-Content -LiteralPath $stepOutputPath -Value ("status={0}" -f $status) }
+}
+
+if ($exitCode -ne 0) { exit 1 }
+exit 0
+) { throw 'INVALID_WHEEL_NAME' }
+            if (-not $seenNames.Add([string]$artifact.filename)) { throw 'DUPLICATE_WHEEL_NAME' }
+            if ($artifact.sha256 -notmatch '^[0-9a-f]{64}    foreach ($ruleName in $script:firewallRuleNames) {
+        Remove-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+    }
+    $script:firewallRuleNames = @()
+    if ($script:candidateUserName) {
+        Remove-LocalUser -Name $script:candidateUserName -ErrorAction SilentlyContinue
+    }
+    if ($script:candidatePassword) {
+        $script:candidatePassword.Dispose()
+        $script:candidatePassword = $null
+    }
+}
+
+function Invoke-Captured {
+    param(
+        [Parameter(Mandatory=$true)][string]$Executable,
+        [Parameter(Mandatory=$true)][string[]]$Arguments,
+        [Parameter(Mandatory=$true)][string]$LogPath,
+        [string]$WorkingDirectory = $runRoot
+    )
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $Executable
+    $psi.WorkingDirectory = $WorkingDirectory
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UserName = $script:candidateUserName
+    $psi.Domain = $env:COMPUTERNAME
+    $psi.Password = $script:candidatePassword
+    $psi.LoadUserProfile = $true
+
+    # Candidate code receives only operating-system and toolchain variables.
+    # No GITHUB_*, ACTIONS_*, RUNNER_*, token, URL, hash, or encryption-key values.
+    $safeEnvironment = @(
+        'PATH','PATHEXT','SystemRoot','WINDIR','SystemDrive','COMPUTERNAME','ProgramFiles','ProgramFiles(x86)','ProgramW6432',
+        'CommonProgramFiles','CommonProgramFiles(x86)','ProgramData','ComSpec',
+        'PROCESSOR_ARCHITECTURE','PROCESSOR_IDENTIFIER','NUMBER_OF_PROCESSORS',
+        'VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsRedistDir',
+        'VisualStudioVersion','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir',
+        'UCRTVersion','INCLUDE','LIB','LIBPATH','VSCMD_VER','VSCMD_ARG_TGT_ARCH',
+        'VSCMD_ARG_HOST_ARCH','DevEnvDir','MSBuildExtensionsPath','MSBuildSDKsPath',
+        'DOTNET_ROOT','DOTNET_ROOT_X64','DOTNET_ROOT_X86'
+    )
+    $psi.Environment.Clear()
+    foreach ($name in $safeEnvironment) {
+        $value = [Environment]::GetEnvironmentVariable($name,'Process')
+        if ($null -ne $value) { $psi.Environment[$name] = $value }
+    }
+    $profileHome = $script:candidateProfile
+    $psi.Environment['USERNAME'] = $script:candidateUserName
+    $psi.Environment['USERDOMAIN'] = $env:COMPUTERNAME
+    $psi.Environment['USERPROFILE'] = $profileHome
+    $psi.Environment['HOME'] = $profileHome
+    $psi.Environment['HOMEDRIVE'] = $env:SystemDrive
+    $psi.Environment['HOMEPATH'] = $profileHome.Substring($env:SystemDrive.Length)
+    $psi.Environment['TEMP'] = $script:candidateTemp
+    $psi.Environment['TMP'] = $script:candidateTemp
+    $psi.Environment['APPDATA'] = Join-Path $profileHome 'AppData/Roaming'
+    $psi.Environment['LOCALAPPDATA'] = Join-Path $profileHome 'AppData/Local'
+    if ($script:pythonDependencyRoot) { $psi.Environment['VALIDATION_PYTHON_DEPENDENCIES'] = $script:pythonDependencyRoot }
+    $psi.Environment['PSModulePath'] = @(
+        (Join-Path $env:ProgramFiles 'PowerShell/Modules'),
+        (Join-Path $env:ProgramFiles 'WindowsPowerShell/Modules'),
+        (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/Modules')
+    ) -join ';'
+
+    foreach ($argument in $Arguments) {
+        [void]$psi.ArgumentList.Add([string]$argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $psi
+    $stdoutTask = $null
+    $stderrTask = $null
+    $processId = 0
+
+    try {
+        if (-not $process.Start()) { throw 'CANDIDATE_PROCESS_START_FAILED' }
+        $processId = $process.Id
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $combined = $stdout + [Environment]::NewLine + '--- STDERR ---' + [Environment]::NewLine + $stderr
+        [System.IO.File]::WriteAllText($LogPath,$combined,[System.Text.UTF8Encoding]::new($false))
+        return [int]$process.ExitCode
+    }
+    finally {
+        if ($processId -gt 0) {
+            Stop-CandidateProcessTree -RootProcessId $processId
+        }
+        $process.Dispose()
+        $psi = $null
+    }
+}
+
+try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+
+    if ([string]::IsNullOrWhiteSpace($sourceUrl)) { throw 'CONFIG_SOURCE_URL_MISSING' }
+    if ($expectedHash -notmatch '^[0-9a-fA-F]{64}$') { throw 'CONFIG_SHA256_INVALID' }
+    if ([string]::IsNullOrWhiteSpace($evidenceKeyB64)) { throw 'CONFIG_EVIDENCE_KEY_MISSING' }
+
+    $keyCheck = [Convert]::FromBase64String($evidenceKeyB64)
+    if ($keyCheck.Length -ne 32) { throw 'CONFIG_EVIDENCE_KEY_LENGTH_INVALID' }
+    [Array]::Clear($keyCheck,0,$keyCheck.Length)
+    $keyCheck = $null
+    $evidenceKeyB64 = $null
+
+    # The signed URL is used only by the bootstrap downloader.
+    Invoke-WebRequest -Uri $sourceUrl -OutFile $archivePath -MaximumRedirection 5 -ErrorAction Stop
+    $sourceUrl = $null
+
+    $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $expectedHash.ToLowerInvariant()) { throw 'SOURCE_SHA256_MISMATCH' }
+    $sourceHashVerified = $true
+    $expectedHash = $null
+
+    Expand-Archive -LiteralPath $archivePath -DestinationPath $payloadRoot -Force
+
+    # Candidate code runs as a temporary standard user with user-scoped inbound
+    # and outbound network blocks. No checkout token or GitHub credential is used.
+    foreach ($name in $secretEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name,$null,'Process')
+        Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+    }
+    $sourceUrl = $null
+    $expectedHash = $null
+    $evidenceKeyB64 = $null
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    Initialize-CandidateSandbox
+
+    $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+    $egressProbe = '$client = $null; try { $client = [Net.Sockets.TcpClient]::new(); $a = $client.BeginConnect("1.1.1.1",443,$null,$null); if ($a.AsyncWaitHandle.WaitOne(2500) -and $client.Connected) { exit 23 }; exit 0 } catch { exit 0 } finally { if ($client) { $client.Dispose() } }'
+    $probeExit = Invoke-Captured -Executable $pwsh -Arguments @('-NoLogo','-NoProfile','-NonInteractive','-Command',$egressProbe) -LogPath (Join-Path $evidenceRoot 'network-isolation-probe.log')
+    if ($probeExit -ne 0) { throw 'SANDBOX_OUTBOUND_NETWORK_NOT_BLOCKED' }
+
+    if ($Lane -eq '01') {
+        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'Invoke-*-WindowsMSVC.ps1' -File -Recurse)
+        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+
+        $runner = $runnerCandidates[0].FullName
+        $packageRoot = $runnerCandidates[0].Directory.FullName
+        $archiveCandidates = @(Get-ChildItem -LiteralPath $packageRoot -Filter '*_CANDIDATE_*.zip' -File)
+        if ($archiveCandidates.Count -ne 1) { throw 'PACKAGE_INPUT_LAYOUT_INVALID' }
+
+        $exitCode = Invoke-Captured -Executable $pwsh -Arguments @(
+            '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',$runner,'-CandidateArchive',$archiveCandidates[0].FullName,
+            '-EvidenceParent',$candidateOutputRoot,'-Configuration','Release','-Parallel','2'
+        ) -LogPath (Join-Path $evidenceRoot 'candidate-runner.log') -WorkingDirectory $packageRoot
+        Copy-CandidateEvidenceSafely
+
+        if ($exitCode -eq 0) { $status = 'PASS_LANE_01_CANDIDATE_VALIDATION' }
+        else { $status = 'FAIL_LANE_01_CANDIDATE_VALIDATION' }
+    }
+    elseif ($Lane -eq '02') {
+        $cmakeCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'CMakeLists.txt' -File -Recurse |
+            Where-Object {
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'src') -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'include') -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'tests') -PathType Container)
+            })
+        if ($cmakeCandidates.Count -ne 1) { throw 'PACKAGE_BUILD_ROOT_LAYOUT_INVALID' }
+        $sourceRoot = $cmakeCandidates[0].Directory.FullName
+
+        $cmake = (Get-Command cmake.exe -ErrorAction Stop).Source
+        New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
+
+        $exitCode = Invoke-Captured -Executable $cmake -Arguments @(
+            '-S',$sourceRoot,'-B',$buildRoot,
+            '-DBUILD_TESTING=ON',
+            '-DCMAKE_CONFIGURATION_TYPES=Release'
+        ) -LogPath (Join-Path $evidenceRoot 'configure.log')
+        if ($exitCode -ne 0) { throw 'BUILD_CONFIGURE_FAILED' }
+
+        $exitCode = Invoke-Captured -Executable $cmake -Arguments @(
+            '--build',$buildRoot,'--config','Release','--parallel','2','--target','ALL_BUILD'
+        ) -LogPath (Join-Path $evidenceRoot 'build.log')
+        if ($exitCode -ne 0) { throw 'FULL_BUILD_FAILED' }
+
+        $ctest = (Get-Command ctest.exe -ErrorAction Stop).Source
+        $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
+            '--test-dir',$buildRoot,'-C','Release','-N'
+        ) -LogPath (Join-Path $evidenceRoot 'test-discovery.log')
+        if ($exitCode -ne 0) { throw 'TEST_DISCOVERY_FAILED' }
+
+        $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
+            '--test-dir',$buildRoot,'-C','Release','--output-on-failure','--verbose',
+            '--parallel','2','--timeout','300','--output-junit',(Join-Path $candidateOutputRoot 'ctest-junit.xml')
+        ) -LogPath (Join-Path $evidenceRoot 'ctest-execution.log')
+
+        Copy-CandidateEvidenceSafely
+        if ($exitCode -eq 0) { $status = 'PASS_LANE_02_BUILD_AND_TESTS' }
+        else { $status = 'FAIL_LANE_02_BUILD_OR_TESTS' }
+    }
+    else {
+        # Generic Windows-client package contract: exactly one runner under the package
+        # must match run_*_integration_windows.py. No product-specific names are embedded
+        # in this public execution infrastructure.
+        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'run_*_integration_windows.py' -File -Recurse)
+        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+
+        $runner = $runnerCandidates[0].FullName
+        $projectRoot = $runnerCandidates[0].Directory.Parent.FullName
+        $requiredSourceRoot = Join-Path $projectRoot 'source/active'
+        if (!(Test-Path -LiteralPath $requiredSourceRoot -PathType Container)) {
+            throw 'PACKAGE_SOURCE_LAYOUT_INVALID'
+        }
+
+        if ([int]$os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 22000) {
+            $status = 'NOT_RUN_REQUIRED_CLIENT_OS_UNAVAILABLE'
+            $exitCode = 0
+            $platformEvidence = [ordered]@{
+                status = $status
+                os_build = $os.BuildNumber
+                product_type = $os.ProductType
+                required_client_os_proof = $false
+                tests_executed = 0
+                runner_entrypoint_count = 1
+                reason = 'The hosted runner is not a supported Windows client OS; no client-OS security tests were executed.'
+            }
+            $platformEvidence | ConvertTo-Json -Depth 5 |
+                Set-Content -LiteralPath (Join-Path $evidenceRoot 'platform-limit.json') -Encoding utf8
+        }
+        else {
+            $python = (Get-Command python.exe -ErrorAction Stop).Source
+            $runnerOutput = Join-Path $candidateOutputRoot 'windows-client'
+            New-Item -ItemType Directory -Path $runnerOutput -Force | Out-Null
+            $runnerLog = Join-Path $evidenceRoot 'windows-client-launch.log'
+            $runnerExit = Invoke-Captured -Executable $python -Arguments @(
+                $runner,'--project-root',$projectRoot,'--output-dir',$runnerOutput
+            ) -LogPath $runnerLog -WorkingDirectory $projectRoot
+
+            $runnerStatus = 'RESULT_UNAVAILABLE'
+            $testCounts = $null
+            $resultPath = Join-Path $runnerOutput 'WINDOWS_LIFECYCLE_RESULT.json'
+            if ((Test-Path -LiteralPath $resultPath -PathType Leaf) -and (Get-Item -LiteralPath $resultPath).Length -le 5MB) {
+                try {
+                    $runnerDocument = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                    if ($runnerDocument.status -is [string] -and $runnerDocument.status -match '^[A-Z0-9_]+$') {
+                        $runnerStatus = $runnerDocument.status
+                    }
+                    $testCounts = [ordered]@{
+                        total = [int]$runnerDocument.tests.total
+                        passed = [int]$runnerDocument.tests.passed
+                        skipped = [int]$runnerDocument.tests.skipped
+                        failures = [int]$runnerDocument.tests.failures
+                        errors = [int]$runnerDocument.tests.errors
+                    }
+                } catch {
+                    $runnerStatus = 'RESULT_PARSE_FAILED'
+                }
+            }
+
+            Copy-CandidateEvidenceSafely
+            $summary = [ordered]@{
+                schema = 'validation.gateway.windows_client_result.v1'
+                runner_status = $runnerStatus
+                runner_exit_code = [int]$runnerExit
+                test_counts = $testCounts
+                windows_client_gate = $true
+                runner_os_label = 'windows-2025'
+            }
+            $summary | ConvertTo-Json -Depth 8 |
+                Set-Content -LiteralPath (Join-Path $evidenceRoot 'runner-summary.json') -Encoding utf8
+
+            if ($runnerExit -eq 0 -and $runnerStatus -eq 'PASS_WINDOWS11_STANDARD_USER' -and
+                $null -ne $testCounts -and $testCounts.total -gt 0 -and
+                $testCounts.skipped -eq 0 -and $testCounts.failures -eq 0 -and $testCounts.errors -eq 0) {
+                $status = 'PASS_LANE_03_WINDOWS_CLIENT_VALIDATION'
+                $exitCode = 0
+            } else {
+                $status = 'FAIL_OR_PARTIAL_LANE_03_PLATFORM_VALIDATION'
+                $exitCode = 1
+            }
+        }
+    }
+}
+catch {
+    $safeCode = [string]$_.Exception.Message
+    if ($safeCode -notmatch '^[A-Z0-9_]+$') { $safeCode = 'EXECUTION_ERROR' }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $evidenceRoot 'failure-code.txt'),
+        $safeCode,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    if ($status -eq 'BLOCKED') { $status = 'BLOCKED_OR_FAILED' }
+    if ($exitCode -eq 0 -and $status -ne 'NOT_RUN_REQUIRED_CLIENT_OS_UNAVAILABLE') { $exitCode = 1 }
+}
+finally {
+    foreach ($name in $secretEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name,$null,'Process')
+        Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+    }
+    $sourceUrl = $null
+    $expectedHash = $null
+    $evidenceKeyB64 = $null
+    Remove-CandidateSandbox
+
+    $final = [ordered]@{
+        schema = 'validation.gateway.execution.v2'
+        lane = $Lane
+        status = $status
+        exit_code = $exitCode
+        source_sha256_actual = $actualHash
+        source_sha256_verified = $sourceHashVerified
+        operating_system = if ($os) { $os.Caption } else { 'UNKNOWN' }
+        os_build = if ($os) { $os.BuildNumber } else { 'UNKNOWN' }
+        os_product_type = if ($os) { $os.ProductType } else { 'UNKNOWN' }
+        required_client_os_proof = ($null -ne $os -and [int]$os.ProductType -eq 1 -and [int]$os.BuildNumber -ge 22000)
+        runner_label = 'windows-2025'
+        candidate_secret_environment_variables_removed = $true
+        started_utc = $startedUtc
+        completed_utc = [DateTime]::UtcNow.ToString('o')
+    }
+    $final | ConvertTo-Json -Depth 8 |
+        Set-Content -LiteralPath (Join-Path $evidenceRoot 'execution-result.json') -Encoding utf8
+    if ($stepOutputPath) { Add-Content -LiteralPath $stepOutputPath -Value ("status={0}" -f $status) }
+}
+
+if ($exitCode -ne 0) { exit 1 }
+exit 0
+) { throw 'INVALID_WHEEL_HASH' }
+            $size = [int64]$artifact.size_bytes
+            if ($size -lt 1 -or $size -gt 10000000) { throw 'INVALID_WHEEL_SIZE' }
+            $totalBytes += $size
+            if ($totalBytes -gt 25000000) { throw 'WHEELHOUSE_SIZE_LIMIT' }
+
+            $uri = [Uri]$artifact.url
+            if (-not $uri.IsAbsoluteUri -or $uri.Scheme -ne 'https' -or
+                $uri.DnsSafeHost -ne 'files.pythonhosted.org' -or
+                $uri.Query -ne '' -or $uri.Fragment -ne '' -or
+                $uri.AbsolutePath -notmatch '^/packages/[A-Za-z0-9._/-]+\.whl    foreach ($ruleName in $script:firewallRuleNames) {
+        Remove-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+    }
+    $script:firewallRuleNames = @()
+    if ($script:candidateUserName) {
+        Remove-LocalUser -Name $script:candidateUserName -ErrorAction SilentlyContinue
+    }
+    if ($script:candidatePassword) {
+        $script:candidatePassword.Dispose()
+        $script:candidatePassword = $null
+    }
+}
+
+function Invoke-Captured {
+    param(
+        [Parameter(Mandatory=$true)][string]$Executable,
+        [Parameter(Mandatory=$true)][string[]]$Arguments,
+        [Parameter(Mandatory=$true)][string]$LogPath,
+        [string]$WorkingDirectory = $runRoot
+    )
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $Executable
+    $psi.WorkingDirectory = $WorkingDirectory
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UserName = $script:candidateUserName
+    $psi.Domain = $env:COMPUTERNAME
+    $psi.Password = $script:candidatePassword
+    $psi.LoadUserProfile = $true
+
+    # Candidate code receives only operating-system and toolchain variables.
+    # No GITHUB_*, ACTIONS_*, RUNNER_*, token, URL, hash, or encryption-key values.
+    $safeEnvironment = @(
+        'PATH','PATHEXT','SystemRoot','WINDIR','SystemDrive','COMPUTERNAME','ProgramFiles','ProgramFiles(x86)','ProgramW6432',
+        'CommonProgramFiles','CommonProgramFiles(x86)','ProgramData','ComSpec',
+        'PROCESSOR_ARCHITECTURE','PROCESSOR_IDENTIFIER','NUMBER_OF_PROCESSORS',
+        'VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsRedistDir',
+        'VisualStudioVersion','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir',
+        'UCRTVersion','INCLUDE','LIB','LIBPATH','VSCMD_VER','VSCMD_ARG_TGT_ARCH',
+        'VSCMD_ARG_HOST_ARCH','DevEnvDir','MSBuildExtensionsPath','MSBuildSDKsPath',
+        'DOTNET_ROOT','DOTNET_ROOT_X64','DOTNET_ROOT_X86'
+    )
+    $psi.Environment.Clear()
+    foreach ($name in $safeEnvironment) {
+        $value = [Environment]::GetEnvironmentVariable($name,'Process')
+        if ($null -ne $value) { $psi.Environment[$name] = $value }
+    }
+    $profileHome = $script:candidateProfile
+    $psi.Environment['USERNAME'] = $script:candidateUserName
+    $psi.Environment['USERDOMAIN'] = $env:COMPUTERNAME
+    $psi.Environment['USERPROFILE'] = $profileHome
+    $psi.Environment['HOME'] = $profileHome
+    $psi.Environment['HOMEDRIVE'] = $env:SystemDrive
+    $psi.Environment['HOMEPATH'] = $profileHome.Substring($env:SystemDrive.Length)
+    $psi.Environment['TEMP'] = $script:candidateTemp
+    $psi.Environment['TMP'] = $script:candidateTemp
+    $psi.Environment['APPDATA'] = Join-Path $profileHome 'AppData/Roaming'
+    $psi.Environment['LOCALAPPDATA'] = Join-Path $profileHome 'AppData/Local'
+    if ($script:pythonDependencyRoot) { $psi.Environment['VALIDATION_PYTHON_DEPENDENCIES'] = $script:pythonDependencyRoot }
+    $psi.Environment['PSModulePath'] = @(
+        (Join-Path $env:ProgramFiles 'PowerShell/Modules'),
+        (Join-Path $env:ProgramFiles 'WindowsPowerShell/Modules'),
+        (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/Modules')
+    ) -join ';'
+
+    foreach ($argument in $Arguments) {
+        [void]$psi.ArgumentList.Add([string]$argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $psi
+    $stdoutTask = $null
+    $stderrTask = $null
+    $processId = 0
+
+    try {
+        if (-not $process.Start()) { throw 'CANDIDATE_PROCESS_START_FAILED' }
+        $processId = $process.Id
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $combined = $stdout + [Environment]::NewLine + '--- STDERR ---' + [Environment]::NewLine + $stderr
+        [System.IO.File]::WriteAllText($LogPath,$combined,[System.Text.UTF8Encoding]::new($false))
+        return [int]$process.ExitCode
+    }
+    finally {
+        if ($processId -gt 0) {
+            Stop-CandidateProcessTree -RootProcessId $processId
+        }
+        $process.Dispose()
+        $psi = $null
+    }
+}
+
+try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+
+    if ([string]::IsNullOrWhiteSpace($sourceUrl)) { throw 'CONFIG_SOURCE_URL_MISSING' }
+    if ($expectedHash -notmatch '^[0-9a-fA-F]{64}$') { throw 'CONFIG_SHA256_INVALID' }
+    if ([string]::IsNullOrWhiteSpace($evidenceKeyB64)) { throw 'CONFIG_EVIDENCE_KEY_MISSING' }
+
+    $keyCheck = [Convert]::FromBase64String($evidenceKeyB64)
+    if ($keyCheck.Length -ne 32) { throw 'CONFIG_EVIDENCE_KEY_LENGTH_INVALID' }
+    [Array]::Clear($keyCheck,0,$keyCheck.Length)
+    $keyCheck = $null
+    $evidenceKeyB64 = $null
+
+    # The signed URL is used only by the bootstrap downloader.
+    Invoke-WebRequest -Uri $sourceUrl -OutFile $archivePath -MaximumRedirection 5 -ErrorAction Stop
+    $sourceUrl = $null
+
+    $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $expectedHash.ToLowerInvariant()) { throw 'SOURCE_SHA256_MISMATCH' }
+    $sourceHashVerified = $true
+    $expectedHash = $null
+
+    Expand-Archive -LiteralPath $archivePath -DestinationPath $payloadRoot -Force
+
+    # Candidate code runs as a temporary standard user with user-scoped inbound
+    # and outbound network blocks. No checkout token or GitHub credential is used.
+    foreach ($name in $secretEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name,$null,'Process')
+        Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+    }
+    $sourceUrl = $null
+    $expectedHash = $null
+    $evidenceKeyB64 = $null
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    Initialize-CandidateSandbox
+
+    $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+    $egressProbe = '$client = $null; try { $client = [Net.Sockets.TcpClient]::new(); $a = $client.BeginConnect("1.1.1.1",443,$null,$null); if ($a.AsyncWaitHandle.WaitOne(2500) -and $client.Connected) { exit 23 }; exit 0 } catch { exit 0 } finally { if ($client) { $client.Dispose() } }'
+    $probeExit = Invoke-Captured -Executable $pwsh -Arguments @('-NoLogo','-NoProfile','-NonInteractive','-Command',$egressProbe) -LogPath (Join-Path $evidenceRoot 'network-isolation-probe.log')
+    if ($probeExit -ne 0) { throw 'SANDBOX_OUTBOUND_NETWORK_NOT_BLOCKED' }
+
+    if ($Lane -eq '01') {
+        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'Invoke-*-WindowsMSVC.ps1' -File -Recurse)
+        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+
+        $runner = $runnerCandidates[0].FullName
+        $packageRoot = $runnerCandidates[0].Directory.FullName
+        $archiveCandidates = @(Get-ChildItem -LiteralPath $packageRoot -Filter '*_CANDIDATE_*.zip' -File)
+        if ($archiveCandidates.Count -ne 1) { throw 'PACKAGE_INPUT_LAYOUT_INVALID' }
+
+        $exitCode = Invoke-Captured -Executable $pwsh -Arguments @(
+            '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',$runner,'-CandidateArchive',$archiveCandidates[0].FullName,
+            '-EvidenceParent',$candidateOutputRoot,'-Configuration','Release','-Parallel','2'
+        ) -LogPath (Join-Path $evidenceRoot 'candidate-runner.log') -WorkingDirectory $packageRoot
+        Copy-CandidateEvidenceSafely
+
+        if ($exitCode -eq 0) { $status = 'PASS_LANE_01_CANDIDATE_VALIDATION' }
+        else { $status = 'FAIL_LANE_01_CANDIDATE_VALIDATION' }
+    }
+    elseif ($Lane -eq '02') {
+        $cmakeCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'CMakeLists.txt' -File -Recurse |
+            Where-Object {
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'src') -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'include') -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'tests') -PathType Container)
+            })
+        if ($cmakeCandidates.Count -ne 1) { throw 'PACKAGE_BUILD_ROOT_LAYOUT_INVALID' }
+        $sourceRoot = $cmakeCandidates[0].Directory.FullName
+
+        $cmake = (Get-Command cmake.exe -ErrorAction Stop).Source
+        New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
+
+        $exitCode = Invoke-Captured -Executable $cmake -Arguments @(
+            '-S',$sourceRoot,'-B',$buildRoot,
+            '-DBUILD_TESTING=ON',
+            '-DCMAKE_CONFIGURATION_TYPES=Release'
+        ) -LogPath (Join-Path $evidenceRoot 'configure.log')
+        if ($exitCode -ne 0) { throw 'BUILD_CONFIGURE_FAILED' }
+
+        $exitCode = Invoke-Captured -Executable $cmake -Arguments @(
+            '--build',$buildRoot,'--config','Release','--parallel','2','--target','ALL_BUILD'
+        ) -LogPath (Join-Path $evidenceRoot 'build.log')
+        if ($exitCode -ne 0) { throw 'FULL_BUILD_FAILED' }
+
+        $ctest = (Get-Command ctest.exe -ErrorAction Stop).Source
+        $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
+            '--test-dir',$buildRoot,'-C','Release','-N'
+        ) -LogPath (Join-Path $evidenceRoot 'test-discovery.log')
+        if ($exitCode -ne 0) { throw 'TEST_DISCOVERY_FAILED' }
+
+        $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
+            '--test-dir',$buildRoot,'-C','Release','--output-on-failure','--verbose',
+            '--parallel','2','--timeout','300','--output-junit',(Join-Path $candidateOutputRoot 'ctest-junit.xml')
+        ) -LogPath (Join-Path $evidenceRoot 'ctest-execution.log')
+
+        Copy-CandidateEvidenceSafely
+        if ($exitCode -eq 0) { $status = 'PASS_LANE_02_BUILD_AND_TESTS' }
+        else { $status = 'FAIL_LANE_02_BUILD_OR_TESTS' }
+    }
+    else {
+        # Generic Windows-client package contract: exactly one runner under the package
+        # must match run_*_integration_windows.py. No product-specific names are embedded
+        # in this public execution infrastructure.
+        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'run_*_integration_windows.py' -File -Recurse)
+        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+
+        $runner = $runnerCandidates[0].FullName
+        $projectRoot = $runnerCandidates[0].Directory.Parent.FullName
+        $requiredSourceRoot = Join-Path $projectRoot 'source/active'
+        if (!(Test-Path -LiteralPath $requiredSourceRoot -PathType Container)) {
+            throw 'PACKAGE_SOURCE_LAYOUT_INVALID'
+        }
+
+        if ([int]$os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 22000) {
+            $status = 'NOT_RUN_REQUIRED_CLIENT_OS_UNAVAILABLE'
+            $exitCode = 0
+            $platformEvidence = [ordered]@{
+                status = $status
+                os_build = $os.BuildNumber
+                product_type = $os.ProductType
+                required_client_os_proof = $false
+                tests_executed = 0
+                runner_entrypoint_count = 1
+                reason = 'The hosted runner is not a supported Windows client OS; no client-OS security tests were executed.'
+            }
+            $platformEvidence | ConvertTo-Json -Depth 5 |
+                Set-Content -LiteralPath (Join-Path $evidenceRoot 'platform-limit.json') -Encoding utf8
+        }
+        else {
+            $python = (Get-Command python.exe -ErrorAction Stop).Source
+            $runnerOutput = Join-Path $candidateOutputRoot 'windows-client'
+            New-Item -ItemType Directory -Path $runnerOutput -Force | Out-Null
+            $runnerLog = Join-Path $evidenceRoot 'windows-client-launch.log'
+            $runnerExit = Invoke-Captured -Executable $python -Arguments @(
+                $runner,'--project-root',$projectRoot,'--output-dir',$runnerOutput
+            ) -LogPath $runnerLog -WorkingDirectory $projectRoot
+
+            $runnerStatus = 'RESULT_UNAVAILABLE'
+            $testCounts = $null
+            $resultPath = Join-Path $runnerOutput 'WINDOWS_LIFECYCLE_RESULT.json'
+            if ((Test-Path -LiteralPath $resultPath -PathType Leaf) -and (Get-Item -LiteralPath $resultPath).Length -le 5MB) {
+                try {
+                    $runnerDocument = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                    if ($runnerDocument.status -is [string] -and $runnerDocument.status -match '^[A-Z0-9_]+$') {
+                        $runnerStatus = $runnerDocument.status
+                    }
+                    $testCounts = [ordered]@{
+                        total = [int]$runnerDocument.tests.total
+                        passed = [int]$runnerDocument.tests.passed
+                        skipped = [int]$runnerDocument.tests.skipped
+                        failures = [int]$runnerDocument.tests.failures
+                        errors = [int]$runnerDocument.tests.errors
+                    }
+                } catch {
+                    $runnerStatus = 'RESULT_PARSE_FAILED'
+                }
+            }
+
+            Copy-CandidateEvidenceSafely
+            $summary = [ordered]@{
+                schema = 'validation.gateway.windows_client_result.v1'
+                runner_status = $runnerStatus
+                runner_exit_code = [int]$runnerExit
+                test_counts = $testCounts
+                windows_client_gate = $true
+                runner_os_label = 'windows-2025'
+            }
+            $summary | ConvertTo-Json -Depth 8 |
+                Set-Content -LiteralPath (Join-Path $evidenceRoot 'runner-summary.json') -Encoding utf8
+
+            if ($runnerExit -eq 0 -and $runnerStatus -eq 'PASS_WINDOWS11_STANDARD_USER' -and
+                $null -ne $testCounts -and $testCounts.total -gt 0 -and
+                $testCounts.skipped -eq 0 -and $testCounts.failures -eq 0 -and $testCounts.errors -eq 0) {
+                $status = 'PASS_LANE_03_WINDOWS_CLIENT_VALIDATION'
+                $exitCode = 0
+            } else {
+                $status = 'FAIL_OR_PARTIAL_LANE_03_PLATFORM_VALIDATION'
+                $exitCode = 1
+            }
+        }
+    }
+}
+catch {
+    $safeCode = [string]$_.Exception.Message
+    if ($safeCode -notmatch '^[A-Z0-9_]+$') { $safeCode = 'EXECUTION_ERROR' }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $evidenceRoot 'failure-code.txt'),
+        $safeCode,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    if ($status -eq 'BLOCKED') { $status = 'BLOCKED_OR_FAILED' }
+    if ($exitCode -eq 0 -and $status -ne 'NOT_RUN_REQUIRED_CLIENT_OS_UNAVAILABLE') { $exitCode = 1 }
+}
+finally {
+    foreach ($name in $secretEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name,$null,'Process')
+        Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+    }
+    $sourceUrl = $null
+    $expectedHash = $null
+    $evidenceKeyB64 = $null
+    Remove-CandidateSandbox
+
+    $final = [ordered]@{
+        schema = 'validation.gateway.execution.v2'
+        lane = $Lane
+        status = $status
+        exit_code = $exitCode
+        source_sha256_actual = $actualHash
+        source_sha256_verified = $sourceHashVerified
+        operating_system = if ($os) { $os.Caption } else { 'UNKNOWN' }
+        os_build = if ($os) { $os.BuildNumber } else { 'UNKNOWN' }
+        os_product_type = if ($os) { $os.ProductType } else { 'UNKNOWN' }
+        required_client_os_proof = ($null -ne $os -and [int]$os.ProductType -eq 1 -and [int]$os.BuildNumber -ge 22000)
+        runner_label = 'windows-2025'
+        candidate_secret_environment_variables_removed = $true
+        started_utc = $startedUtc
+        completed_utc = [DateTime]::UtcNow.ToString('o')
+    }
+    $final | ConvertTo-Json -Depth 8 |
+        Set-Content -LiteralPath (Join-Path $evidenceRoot 'execution-result.json') -Encoding utf8
+    if ($stepOutputPath) { Add-Content -LiteralPath $stepOutputPath -Value ("status={0}" -f $status) }
+}
+
+if ($exitCode -ne 0) { exit 1 }
+exit 0
+) {
+                throw 'WHEEL_URL_NOT_ALLOWLISTED'
+            }
+            $urlFileName = [Uri]::UnescapeDataString(($uri.AbsolutePath -split '/')[-1])
+            if ($urlFileName -ne $artifact.filename) { throw 'WHEEL_URL_NAME_MISMATCH' }
+        }
+
+        $wheelhouse = Join-Path $runRoot 'wheelhouse'
+        $script:pythonDependencyRoot = Join-Path $runRoot 'python-dependencies'
+        New-Item -ItemType Directory -Path $wheelhouse,$script:pythonDependencyRoot -Force | Out-Null
+
+        foreach ($artifact in $manifest.artifacts) {
+            $destination = Join-Path $wheelhouse $artifact.filename
+            try {
+                Invoke-WebRequest -Uri ([string]$artifact.url) -OutFile $destination -MaximumRedirection 0 -TimeoutSec 90 -ErrorAction Stop
+            } catch {
+                Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+                throw 'VALIDATION_DEPENDENCY_DOWNLOAD_FAILED'
+            }
+            $actualSize = (Get-Item -LiteralPath $destination -ErrorAction Stop).Length
+            if ($actualSize -ne [int64]$artifact.size_bytes) { throw 'VALIDATION_DEPENDENCY_SIZE_MISMATCH' }
+            $actualSha = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualSha -ne $artifact.sha256) { throw 'VALIDATION_DEPENDENCY_HASH_MISMATCH' }
+        }
+
+        $python = (Get-Command python.exe -ErrorAction Stop).Source
+        & $python -m pip install --disable-pip-version-check --no-index --find-links $wheelhouse --require-hashes --only-binary=:all: --no-compile --target $script:pythonDependencyRoot -r $lockPath 1>$null 2>$null
+        if ($LASTEXITCODE -ne 0) { throw 'VALIDATION_DEPENDENCY_INSTALL_FAILED' }
+    } catch {
+        $script:pythonDependencyRoot = $null
+        $safe = [string]$_.Exception.Message
+        if ($safe -notmatch '^[A-Z0-9_]+    foreach ($ruleName in $script:firewallRuleNames) {
+        Remove-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+    }
+    $script:firewallRuleNames = @()
+    if ($script:candidateUserName) {
+        Remove-LocalUser -Name $script:candidateUserName -ErrorAction SilentlyContinue
+    }
+    if ($script:candidatePassword) {
+        $script:candidatePassword.Dispose()
+        $script:candidatePassword = $null
+    }
+}
+
+function Invoke-Captured {
+    param(
+        [Parameter(Mandatory=$true)][string]$Executable,
+        [Parameter(Mandatory=$true)][string[]]$Arguments,
+        [Parameter(Mandatory=$true)][string]$LogPath,
+        [string]$WorkingDirectory = $runRoot
+    )
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $Executable
+    $psi.WorkingDirectory = $WorkingDirectory
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UserName = $script:candidateUserName
+    $psi.Domain = $env:COMPUTERNAME
+    $psi.Password = $script:candidatePassword
+    $psi.LoadUserProfile = $true
+
+    # Candidate code receives only operating-system and toolchain variables.
+    # No GITHUB_*, ACTIONS_*, RUNNER_*, token, URL, hash, or encryption-key values.
+    $safeEnvironment = @(
+        'PATH','PATHEXT','SystemRoot','WINDIR','SystemDrive','COMPUTERNAME','ProgramFiles','ProgramFiles(x86)','ProgramW6432',
+        'CommonProgramFiles','CommonProgramFiles(x86)','ProgramData','ComSpec',
+        'PROCESSOR_ARCHITECTURE','PROCESSOR_IDENTIFIER','NUMBER_OF_PROCESSORS',
+        'VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsRedistDir',
+        'VisualStudioVersion','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir',
+        'UCRTVersion','INCLUDE','LIB','LIBPATH','VSCMD_VER','VSCMD_ARG_TGT_ARCH',
+        'VSCMD_ARG_HOST_ARCH','DevEnvDir','MSBuildExtensionsPath','MSBuildSDKsPath',
+        'DOTNET_ROOT','DOTNET_ROOT_X64','DOTNET_ROOT_X86'
+    )
+    $psi.Environment.Clear()
+    foreach ($name in $safeEnvironment) {
+        $value = [Environment]::GetEnvironmentVariable($name,'Process')
+        if ($null -ne $value) { $psi.Environment[$name] = $value }
+    }
+    $profileHome = $script:candidateProfile
+    $psi.Environment['USERNAME'] = $script:candidateUserName
+    $psi.Environment['USERDOMAIN'] = $env:COMPUTERNAME
+    $psi.Environment['USERPROFILE'] = $profileHome
+    $psi.Environment['HOME'] = $profileHome
+    $psi.Environment['HOMEDRIVE'] = $env:SystemDrive
+    $psi.Environment['HOMEPATH'] = $profileHome.Substring($env:SystemDrive.Length)
+    $psi.Environment['TEMP'] = $script:candidateTemp
+    $psi.Environment['TMP'] = $script:candidateTemp
+    $psi.Environment['APPDATA'] = Join-Path $profileHome 'AppData/Roaming'
+    $psi.Environment['LOCALAPPDATA'] = Join-Path $profileHome 'AppData/Local'
+    if ($script:pythonDependencyRoot) { $psi.Environment['VALIDATION_PYTHON_DEPENDENCIES'] = $script:pythonDependencyRoot }
+    $psi.Environment['PSModulePath'] = @(
+        (Join-Path $env:ProgramFiles 'PowerShell/Modules'),
+        (Join-Path $env:ProgramFiles 'WindowsPowerShell/Modules'),
+        (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/Modules')
+    ) -join ';'
+
+    foreach ($argument in $Arguments) {
+        [void]$psi.ArgumentList.Add([string]$argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $psi
+    $stdoutTask = $null
+    $stderrTask = $null
+    $processId = 0
+
+    try {
+        if (-not $process.Start()) { throw 'CANDIDATE_PROCESS_START_FAILED' }
+        $processId = $process.Id
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $combined = $stdout + [Environment]::NewLine + '--- STDERR ---' + [Environment]::NewLine + $stderr
+        [System.IO.File]::WriteAllText($LogPath,$combined,[System.Text.UTF8Encoding]::new($false))
+        return [int]$process.ExitCode
+    }
+    finally {
+        if ($processId -gt 0) {
+            Stop-CandidateProcessTree -RootProcessId $processId
+        }
+        $process.Dispose()
+        $psi = $null
+    }
+}
+
+try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+
+    if ([string]::IsNullOrWhiteSpace($sourceUrl)) { throw 'CONFIG_SOURCE_URL_MISSING' }
+    if ($expectedHash -notmatch '^[0-9a-fA-F]{64}$') { throw 'CONFIG_SHA256_INVALID' }
+    if ([string]::IsNullOrWhiteSpace($evidenceKeyB64)) { throw 'CONFIG_EVIDENCE_KEY_MISSING' }
+
+    $keyCheck = [Convert]::FromBase64String($evidenceKeyB64)
+    if ($keyCheck.Length -ne 32) { throw 'CONFIG_EVIDENCE_KEY_LENGTH_INVALID' }
+    [Array]::Clear($keyCheck,0,$keyCheck.Length)
+    $keyCheck = $null
+    $evidenceKeyB64 = $null
+
+    # The signed URL is used only by the bootstrap downloader.
+    Invoke-WebRequest -Uri $sourceUrl -OutFile $archivePath -MaximumRedirection 5 -ErrorAction Stop
+    $sourceUrl = $null
+
+    $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $expectedHash.ToLowerInvariant()) { throw 'SOURCE_SHA256_MISMATCH' }
+    $sourceHashVerified = $true
+    $expectedHash = $null
+
+    Expand-Archive -LiteralPath $archivePath -DestinationPath $payloadRoot -Force
+
+    # Candidate code runs as a temporary standard user with user-scoped inbound
+    # and outbound network blocks. No checkout token or GitHub credential is used.
+    foreach ($name in $secretEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name,$null,'Process')
+        Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+    }
+    $sourceUrl = $null
+    $expectedHash = $null
+    $evidenceKeyB64 = $null
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    Initialize-CandidateSandbox
+
+    $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+    $egressProbe = '$client = $null; try { $client = [Net.Sockets.TcpClient]::new(); $a = $client.BeginConnect("1.1.1.1",443,$null,$null); if ($a.AsyncWaitHandle.WaitOne(2500) -and $client.Connected) { exit 23 }; exit 0 } catch { exit 0 } finally { if ($client) { $client.Dispose() } }'
+    $probeExit = Invoke-Captured -Executable $pwsh -Arguments @('-NoLogo','-NoProfile','-NonInteractive','-Command',$egressProbe) -LogPath (Join-Path $evidenceRoot 'network-isolation-probe.log')
+    if ($probeExit -ne 0) { throw 'SANDBOX_OUTBOUND_NETWORK_NOT_BLOCKED' }
+
+    if ($Lane -eq '01') {
+        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'Invoke-*-WindowsMSVC.ps1' -File -Recurse)
+        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+
+        $runner = $runnerCandidates[0].FullName
+        $packageRoot = $runnerCandidates[0].Directory.FullName
+        $archiveCandidates = @(Get-ChildItem -LiteralPath $packageRoot -Filter '*_CANDIDATE_*.zip' -File)
+        if ($archiveCandidates.Count -ne 1) { throw 'PACKAGE_INPUT_LAYOUT_INVALID' }
+
+        $exitCode = Invoke-Captured -Executable $pwsh -Arguments @(
+            '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',$runner,'-CandidateArchive',$archiveCandidates[0].FullName,
+            '-EvidenceParent',$candidateOutputRoot,'-Configuration','Release','-Parallel','2'
+        ) -LogPath (Join-Path $evidenceRoot 'candidate-runner.log') -WorkingDirectory $packageRoot
+        Copy-CandidateEvidenceSafely
+
+        if ($exitCode -eq 0) { $status = 'PASS_LANE_01_CANDIDATE_VALIDATION' }
+        else { $status = 'FAIL_LANE_01_CANDIDATE_VALIDATION' }
+    }
+    elseif ($Lane -eq '02') {
+        $cmakeCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'CMakeLists.txt' -File -Recurse |
+            Where-Object {
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'src') -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'include') -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'tests') -PathType Container)
+            })
+        if ($cmakeCandidates.Count -ne 1) { throw 'PACKAGE_BUILD_ROOT_LAYOUT_INVALID' }
+        $sourceRoot = $cmakeCandidates[0].Directory.FullName
+
+        $cmake = (Get-Command cmake.exe -ErrorAction Stop).Source
+        New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
+
+        $exitCode = Invoke-Captured -Executable $cmake -Arguments @(
+            '-S',$sourceRoot,'-B',$buildRoot,
+            '-DBUILD_TESTING=ON',
+            '-DCMAKE_CONFIGURATION_TYPES=Release'
+        ) -LogPath (Join-Path $evidenceRoot 'configure.log')
+        if ($exitCode -ne 0) { throw 'BUILD_CONFIGURE_FAILED' }
+
+        $exitCode = Invoke-Captured -Executable $cmake -Arguments @(
+            '--build',$buildRoot,'--config','Release','--parallel','2','--target','ALL_BUILD'
+        ) -LogPath (Join-Path $evidenceRoot 'build.log')
+        if ($exitCode -ne 0) { throw 'FULL_BUILD_FAILED' }
+
+        $ctest = (Get-Command ctest.exe -ErrorAction Stop).Source
+        $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
+            '--test-dir',$buildRoot,'-C','Release','-N'
+        ) -LogPath (Join-Path $evidenceRoot 'test-discovery.log')
+        if ($exitCode -ne 0) { throw 'TEST_DISCOVERY_FAILED' }
+
+        $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
+            '--test-dir',$buildRoot,'-C','Release','--output-on-failure','--verbose',
+            '--parallel','2','--timeout','300','--output-junit',(Join-Path $candidateOutputRoot 'ctest-junit.xml')
+        ) -LogPath (Join-Path $evidenceRoot 'ctest-execution.log')
+
+        Copy-CandidateEvidenceSafely
+        if ($exitCode -eq 0) { $status = 'PASS_LANE_02_BUILD_AND_TESTS' }
+        else { $status = 'FAIL_LANE_02_BUILD_OR_TESTS' }
+    }
+    else {
+        # Generic Windows-client package contract: exactly one runner under the package
+        # must match run_*_integration_windows.py. No product-specific names are embedded
+        # in this public execution infrastructure.
+        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'run_*_integration_windows.py' -File -Recurse)
+        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+
+        $runner = $runnerCandidates[0].FullName
+        $projectRoot = $runnerCandidates[0].Directory.Parent.FullName
+        $requiredSourceRoot = Join-Path $projectRoot 'source/active'
+        if (!(Test-Path -LiteralPath $requiredSourceRoot -PathType Container)) {
+            throw 'PACKAGE_SOURCE_LAYOUT_INVALID'
+        }
+
+        if ([int]$os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 22000) {
+            $status = 'NOT_RUN_REQUIRED_CLIENT_OS_UNAVAILABLE'
+            $exitCode = 0
+            $platformEvidence = [ordered]@{
+                status = $status
+                os_build = $os.BuildNumber
+                product_type = $os.ProductType
+                required_client_os_proof = $false
+                tests_executed = 0
+                runner_entrypoint_count = 1
+                reason = 'The hosted runner is not a supported Windows client OS; no client-OS security tests were executed.'
+            }
+            $platformEvidence | ConvertTo-Json -Depth 5 |
+                Set-Content -LiteralPath (Join-Path $evidenceRoot 'platform-limit.json') -Encoding utf8
+        }
+        else {
+            $python = (Get-Command python.exe -ErrorAction Stop).Source
+            $runnerOutput = Join-Path $candidateOutputRoot 'windows-client'
+            New-Item -ItemType Directory -Path $runnerOutput -Force | Out-Null
+            $runnerLog = Join-Path $evidenceRoot 'windows-client-launch.log'
+            $runnerExit = Invoke-Captured -Executable $python -Arguments @(
+                $runner,'--project-root',$projectRoot,'--output-dir',$runnerOutput
+            ) -LogPath $runnerLog -WorkingDirectory $projectRoot
+
+            $runnerStatus = 'RESULT_UNAVAILABLE'
+            $testCounts = $null
+            $resultPath = Join-Path $runnerOutput 'WINDOWS_LIFECYCLE_RESULT.json'
+            if ((Test-Path -LiteralPath $resultPath -PathType Leaf) -and (Get-Item -LiteralPath $resultPath).Length -le 5MB) {
+                try {
+                    $runnerDocument = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                    if ($runnerDocument.status -is [string] -and $runnerDocument.status -match '^[A-Z0-9_]+$') {
+                        $runnerStatus = $runnerDocument.status
+                    }
+                    $testCounts = [ordered]@{
+                        total = [int]$runnerDocument.tests.total
+                        passed = [int]$runnerDocument.tests.passed
+                        skipped = [int]$runnerDocument.tests.skipped
+                        failures = [int]$runnerDocument.tests.failures
+                        errors = [int]$runnerDocument.tests.errors
+                    }
+                } catch {
+                    $runnerStatus = 'RESULT_PARSE_FAILED'
+                }
+            }
+
+            Copy-CandidateEvidenceSafely
+            $summary = [ordered]@{
+                schema = 'validation.gateway.windows_client_result.v1'
+                runner_status = $runnerStatus
+                runner_exit_code = [int]$runnerExit
+                test_counts = $testCounts
+                windows_client_gate = $true
+                runner_os_label = 'windows-2025'
+            }
+            $summary | ConvertTo-Json -Depth 8 |
+                Set-Content -LiteralPath (Join-Path $evidenceRoot 'runner-summary.json') -Encoding utf8
+
+            if ($runnerExit -eq 0 -and $runnerStatus -eq 'PASS_WINDOWS11_STANDARD_USER' -and
+                $null -ne $testCounts -and $testCounts.total -gt 0 -and
+                $testCounts.skipped -eq 0 -and $testCounts.failures -eq 0 -and $testCounts.errors -eq 0) {
+                $status = 'PASS_LANE_03_WINDOWS_CLIENT_VALIDATION'
+                $exitCode = 0
+            } else {
+                $status = 'FAIL_OR_PARTIAL_LANE_03_PLATFORM_VALIDATION'
+                $exitCode = 1
+            }
+        }
+    }
+}
+catch {
+    $safeCode = [string]$_.Exception.Message
+    if ($safeCode -notmatch '^[A-Z0-9_]+$') { $safeCode = 'EXECUTION_ERROR' }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $evidenceRoot 'failure-code.txt'),
+        $safeCode,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    if ($status -eq 'BLOCKED') { $status = 'BLOCKED_OR_FAILED' }
+    if ($exitCode -eq 0 -and $status -ne 'NOT_RUN_REQUIRED_CLIENT_OS_UNAVAILABLE') { $exitCode = 1 }
+}
+finally {
+    foreach ($name in $secretEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name,$null,'Process')
+        Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+    }
+    $sourceUrl = $null
+    $expectedHash = $null
+    $evidenceKeyB64 = $null
+    Remove-CandidateSandbox
+
+    $final = [ordered]@{
+        schema = 'validation.gateway.execution.v2'
+        lane = $Lane
+        status = $status
+        exit_code = $exitCode
+        source_sha256_actual = $actualHash
+        source_sha256_verified = $sourceHashVerified
+        operating_system = if ($os) { $os.Caption } else { 'UNKNOWN' }
+        os_build = if ($os) { $os.BuildNumber } else { 'UNKNOWN' }
+        os_product_type = if ($os) { $os.ProductType } else { 'UNKNOWN' }
+        required_client_os_proof = ($null -ne $os -and [int]$os.ProductType -eq 1 -and [int]$os.BuildNumber -ge 22000)
+        runner_label = 'windows-2025'
+        candidate_secret_environment_variables_removed = $true
+        started_utc = $startedUtc
+        completed_utc = [DateTime]::UtcNow.ToString('o')
+    }
+    $final | ConvertTo-Json -Depth 8 |
+        Set-Content -LiteralPath (Join-Path $evidenceRoot 'execution-result.json') -Encoding utf8
+    if ($stepOutputPath) { Add-Content -LiteralPath $stepOutputPath -Value ("status={0}" -f $status) }
+}
+
+if ($exitCode -ne 0) { exit 1 }
+exit 0
+) { $safe = 'VALIDATION_DEPENDENCY_BOOTSTRAP_FAILED' }
+        throw $safe
     }
 }
 
@@ -227,6 +2282,7 @@ function Invoke-Captured {
     $psi.Environment['TMP'] = $script:candidateTemp
     $psi.Environment['APPDATA'] = Join-Path $profileHome 'AppData/Roaming'
     $psi.Environment['LOCALAPPDATA'] = Join-Path $profileHome 'AppData/Local'
+    if ($script:pythonDependencyRoot) { $psi.Environment['VALIDATION_PYTHON_DEPENDENCIES'] = $script:pythonDependencyRoot }
     $psi.Environment['PSModulePath'] = @(
         (Join-Path $env:ProgramFiles 'PowerShell/Modules'),
         (Join-Path $env:ProgramFiles 'WindowsPowerShell/Modules'),
