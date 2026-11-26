@@ -124,18 +124,15 @@ function Initialize-CandidateSandbox {
 
     $script:candidateProfile = Join-Path $env:SystemDrive ("Users\" + $script:candidateUserName)
     $script:candidateTemp = Join-Path $runRoot 'candidate-temp'
-    New-Item -ItemType Directory -Path $script:candidateProfile,$script:candidateTemp -Force | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $script:candidateProfile 'AppData\Roaming'),(Join-Path $script:candidateProfile 'AppData\Local') -Force | Out-Null
+    New-Item -ItemType Directory -Path $script:candidateTemp -Force | Out-Null
 
     $sidAceTraverse = "*$($script:candidateSid):(X)"
     $sidAceModify = "*$($script:candidateSid):(OI)(CI)M"
-    $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+    $icacls = Join-Path $env:SystemRoot 'System32/icacls.exe'
     & $icacls $env:RUNNER_TEMP /grant $sidAceTraverse /Q | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_TEMP_TRAVERSE_ACL_FAILED' }
     & $icacls $runRoot /grant $sidAceModify /T /C /Q | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_RUNROOT_ACL_FAILED' }
-    & $icacls $script:candidateProfile /grant $sidAceModify /T /C /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_PROFILE_ACL_FAILED' }
 }
 
 function Remove-CandidateSandbox {
