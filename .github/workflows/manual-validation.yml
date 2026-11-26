@@ -23,35 +23,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Validate lane secrets are configured
-        id: preflight
-        shell: pwsh
-        env:
-          LANE_SOURCE_URL_01: ${{ inputs.lane == '01' && secrets.SOURCE_URL_01 || '' }}
-          LANE_SOURCE_SHA256_01: ${{ inputs.lane == '01' && secrets.SOURCE_SHA256_01 || '' }}
-          LANE_EVIDENCE_KEY_B64_01: ${{ inputs.lane == '01' && secrets.EVIDENCE_KEY_B64_01 || '' }}
-          LANE_SOURCE_URL_02: ${{ inputs.lane == '02' && secrets.SOURCE_URL_02 || '' }}
-          LANE_SOURCE_SHA256_02: ${{ inputs.lane == '02' && secrets.SOURCE_SHA256_02 || '' }}
-          LANE_EVIDENCE_KEY_B64_02: ${{ inputs.lane == '02' && secrets.EVIDENCE_KEY_B64_02 || '' }}
-          LANE_SOURCE_URL_03: ${{ inputs.lane == '03' && secrets.SOURCE_URL_03 || '' }}
-          LANE_SOURCE_SHA256_03: ${{ inputs.lane == '03' && secrets.SOURCE_SHA256_03 || '' }}
-          LANE_EVIDENCE_KEY_B64_03: ${{ inputs.lane == '03' && secrets.EVIDENCE_KEY_B64_03 || '' }}
-        run: |
-          $lane = '${{ inputs.lane }}'
-          $required = @("SOURCE_URL_$lane","SOURCE_SHA256_$lane","EVIDENCE_KEY_B64_$lane")
-          $missing = [System.Collections.Generic.List[string]]::new()
-          foreach ($name in $required) {
-            $value = [Environment]::GetEnvironmentVariable("LANE_" + $name)
-            if ([string]::IsNullOrWhiteSpace($value)) { $missing.Add($name) }
-          }
-          if ($missing.Count -gt 0) {
-            Write-Output ('CONFIG_MISSING: ' + ($missing -join ', '))
-            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            exit 1
-          }
-          "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Output 'LANE_CONFIGURATION_PRESENT'
-
       - name: Load pinned generic executor without repository credentials
         id: executor
         if: ${{ steps.preflight.outcome == 'success' }}
@@ -69,30 +40,43 @@ jobs:
           [Array]::Clear($bytes,0,$bytes.Length)
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("path={0}" -f $scriptPath)
           Write-Output 'TRUSTED_EXECUTOR_LOADED'
+      - name: Validate lane secrets are configured
+        id: preflight
+        shell: pwsh
+        env:
+          LANE_SOURCE_URL: ${{ secrets[format('SOURCE_URL_{0}', inputs.lane)] }}
+          LANE_SOURCE_SHA256: ${{ secrets[format('SOURCE_SHA256_{0}', inputs.lane)] }}
+          LANE_EVIDENCE_KEY_B64: ${{ secrets[format('EVIDENCE_KEY_B64_{0}', inputs.lane)] }}
+        run: |
+          $lane = '${{ inputs.lane }}'
+          $required = @('LANE_SOURCE_URL','LANE_SOURCE_SHA256','LANE_EVIDENCE_KEY_B64')
+          $missing = [System.Collections.Generic.List[string]]::new()
+          foreach ($name in $required) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrWhiteSpace($value)) { $missing.Add($name) }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Output ('CONFIG_MISSING: ' + ($missing -join ', '))
+            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 1
+          }
+          "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Output 'LANE_CONFIGURATION_PRESENT'
+
       - name: Execute isolated validation
         id: execute
         if: ${{ steps.preflight.outcome == 'success' && steps.executor.outcome == 'success' }}
         shell: pwsh
         env:
-          SOURCE_URL_01: ${{ inputs.lane == '01' && secrets.SOURCE_URL_01 || '' }}
-          SOURCE_SHA256_01: ${{ inputs.lane == '01' && secrets.SOURCE_SHA256_01 || '' }}
-          EVIDENCE_KEY_B64_01: ${{ inputs.lane == '01' && secrets.EVIDENCE_KEY_B64_01 || '' }}
-          SOURCE_URL_02: ${{ inputs.lane == '02' && secrets.SOURCE_URL_02 || '' }}
-          SOURCE_SHA256_02: ${{ inputs.lane == '02' && secrets.SOURCE_SHA256_02 || '' }}
-          EVIDENCE_KEY_B64_02: ${{ inputs.lane == '02' && secrets.EVIDENCE_KEY_B64_02 || '' }}
-          SOURCE_URL_03: ${{ inputs.lane == '03' && secrets.SOURCE_URL_03 || '' }}
-          SOURCE_SHA256_03: ${{ inputs.lane == '03' && secrets.SOURCE_SHA256_03 || '' }}
-          EVIDENCE_KEY_B64_03: ${{ inputs.lane == '03' && secrets.EVIDENCE_KEY_B64_03 || '' }}
+          LANE_SOURCE_URL: ${{ secrets[format('SOURCE_URL_{0}', inputs.lane)] }}
+          LANE_SOURCE_SHA256: ${{ secrets[format('SOURCE_SHA256_{0}', inputs.lane)] }}
+          LANE_EVIDENCE_KEY_B64: ${{ secrets[format('EVIDENCE_KEY_B64_{0}', inputs.lane)] }}
         run: |
           $lane = '${{ inputs.lane }}'
-          $env:SOURCE_URL = [Environment]::GetEnvironmentVariable("SOURCE_URL_$lane")
-          $env:SOURCE_SHA256 = [Environment]::GetEnvironmentVariable("SOURCE_SHA256_$lane")
-          $env:EVIDENCE_KEY_B64 = [Environment]::GetEnvironmentVariable("EVIDENCE_KEY_B64_$lane")
-          foreach ($suffix in '01','02','03') {
-            [Environment]::SetEnvironmentVariable("SOURCE_URL_$suffix",$null,'Process')
-            [Environment]::SetEnvironmentVariable("SOURCE_SHA256_$suffix",$null,'Process')
-            [Environment]::SetEnvironmentVariable("EVIDENCE_KEY_B64_$suffix",$null,'Process')
-          }
+          $env:SOURCE_URL = $env:LANE_SOURCE_URL
+          $env:SOURCE_SHA256 = $env:LANE_SOURCE_SHA256
+          $env:EVIDENCE_KEY_B64 = $env:LANE_EVIDENCE_KEY_B64
+          Remove-Item Env:LANE_SOURCE_URL,Env:LANE_SOURCE_SHA256,Env:LANE_EVIDENCE_KEY_B64 -ErrorAction SilentlyContinue
           $executorPath = '${{ steps.executor.outputs.path }}'
           & $executorPath -Lane $lane
       - name: Seal evidence
@@ -100,15 +84,11 @@ jobs:
         if: ${{ always() && steps.preflight.outcome == 'success' }}
         shell: pwsh
         env:
-          EVIDENCE_KEY_B64_01: ${{ inputs.lane == '01' && secrets.EVIDENCE_KEY_B64_01 || '' }}
-          EVIDENCE_KEY_B64_02: ${{ inputs.lane == '02' && secrets.EVIDENCE_KEY_B64_02 || '' }}
-          EVIDENCE_KEY_B64_03: ${{ inputs.lane == '03' && secrets.EVIDENCE_KEY_B64_03 || '' }}
+          LANE_EVIDENCE_KEY_B64: ${{ secrets[format('EVIDENCE_KEY_B64_{0}', inputs.lane)] }}
         run: |
           $lane = '${{ inputs.lane }}'
-          $env:EVIDENCE_KEY_B64 = [Environment]::GetEnvironmentVariable("EVIDENCE_KEY_B64_$lane")
-          foreach ($suffix in '01','02','03') {
-            [Environment]::SetEnvironmentVariable("EVIDENCE_KEY_B64_$suffix",$null,'Process')
-          }
+          $env:EVIDENCE_KEY_B64 = $env:LANE_EVIDENCE_KEY_B64
+          Remove-Item Env:LANE_EVIDENCE_KEY_B64 -ErrorAction SilentlyContinue
           $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/seal.ps1?ref=bd82e6b951b21aa5c8d134d159cd86c8f100eb32'
           $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
           if ($item.sha -ne 'd46036edbfb8a3866336eb10d6289caf0bb4c7ff' -or $item.encoding -ne 'base64') {
