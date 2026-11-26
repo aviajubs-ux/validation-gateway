@@ -175,7 +175,7 @@ function Invoke-Captured {
     # Candidate code receives only operating-system and toolchain variables.
     # No GITHUB_*, ACTIONS_*, RUNNER_*, token, URL, hash, or encryption-key values.
     $safeEnvironment = @(
-        'PATH','PATHEXT','SystemRoot','WINDIR','ProgramFiles','ProgramFiles(x86)','ProgramW6432',
+        'PATH','PATHEXT','SystemRoot','WINDIR','SystemDrive','COMPUTERNAME','ProgramFiles','ProgramFiles(x86)','ProgramW6432',
         'CommonProgramFiles','CommonProgramFiles(x86)','ProgramData','ComSpec',
         'PROCESSOR_ARCHITECTURE','PROCESSOR_IDENTIFIER','NUMBER_OF_PROCESSORS',
         'VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsRedistDir',
@@ -198,12 +198,12 @@ function Invoke-Captured {
     $psi.Environment['HOMEPATH'] = $profileHome.Substring($env:SystemDrive.Length)
     $psi.Environment['TEMP'] = $script:candidateTemp
     $psi.Environment['TMP'] = $script:candidateTemp
-    $psi.Environment['APPDATA'] = Join-Path $profileHome 'AppDataRoaming'
-    $psi.Environment['LOCALAPPDATA'] = Join-Path $profileHome 'AppDataLocal'
+    $psi.Environment['APPDATA'] = Join-Path $profileHome 'AppData/Roaming'
+    $psi.Environment['LOCALAPPDATA'] = Join-Path $profileHome 'AppData/Local'
     $psi.Environment['PSModulePath'] = @(
-        (Join-Path $env:ProgramFiles 'PowerShellModules'),
-        (Join-Path $env:ProgramFiles 'WindowsPowerShellModules'),
-        (Join-Path $env:SystemRoot 'System32WindowsPowerShell1.0Modules')
+        (Join-Path $env:ProgramFiles 'PowerShell/Modules'),
+        (Join-Path $env:ProgramFiles 'WindowsPowerShell/Modules'),
+        (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/Modules')
     ) -join ';'
 
     foreach ($argument in $Arguments) {
