@@ -23,11 +23,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Load runner harness
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-          fetch-depth: 1
       - name: Validate lane secrets are configured
         id: preflight
         shell: pwsh
@@ -56,9 +51,27 @@ jobs:
           }
           "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Output 'LANE_CONFIGURATION_PRESENT'
+
+      - name: Load pinned generic executor without repository credentials
+        id: executor
+        if: ${{ steps.preflight.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=8b5ed5710457b8d99ba13f87a0fbc62e8606e73f'
+          $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
+          if ($item.sha -ne '7de22c48241692cc54e4a2f6ecc0df1a0ca09204' -or $item.encoding -ne 'base64') {
+            throw 'TRUSTED_EXECUTOR_INTEGRITY_FAILURE'
+          }
+          $encoded = ($item.content -replace '\s','')
+          $bytes = [Convert]::FromBase64String($encoded)
+          $scriptPath = Join-Path $env:RUNNER_TEMP 'generic-executor.ps1'
+          [IO.File]::WriteAllBytes($scriptPath,$bytes)
+          [Array]::Clear($bytes,0,$bytes.Length)
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("path={0}" -f $scriptPath)
+          Write-Output 'TRUSTED_EXECUTOR_LOADED'
       - name: Execute isolated validation
         id: execute
-        if: ${{ steps.preflight.outcome == 'success' }}
+        if: ${{ steps.preflight.outcome == 'success' && steps.executor.outcome == 'success' }}
         shell: pwsh
         env:
           SOURCE_URL_01: ${{ inputs.lane == '01' && secrets.SOURCE_URL_01 || '' }}
@@ -80,7 +93,8 @@ jobs:
             [Environment]::SetEnvironmentVariable("SOURCE_SHA256_$suffix",$null,'Process')
             [Environment]::SetEnvironmentVariable("EVIDENCE_KEY_B64_$suffix",$null,'Process')
           }
-          & "$env:GITHUB_WORKSPACE/.github/scripts/execute.ps1" -Lane $lane
+          $executorPath = '${{ steps.executor.outputs.path }}'
+          & $executorPath -Lane $lane
       - name: Seal evidence
         id: seal
         if: ${{ always() && steps.preflight.outcome == 'success' }}
@@ -95,12 +109,18 @@ jobs:
           foreach ($suffix in '01','02','03') {
             [Environment]::SetEnvironmentVariable("EVIDENCE_KEY_B64_$suffix",$null,'Process')
           }
-          $sealScript = Join-Path $env:GITHUB_WORKSPACE '.github/scripts/seal.ps1'
-          $actualSealHash = (Get-FileHash -LiteralPath $sealScript -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSealHash -ne 'd46036edbfb8a3866336eb10d6289caf0bb4c7ff') {
+          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/seal.ps1?ref=8b5ed5710457b8d99ba13f87a0fbc62e8606e73f'
+          $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
+          if ($item.sha -ne 'd46036edbfb8a3866336eb10d6289caf0bb4c7ff' -or $item.encoding -ne 'base64') {
             throw 'TRUSTED_SEAL_SCRIPT_INTEGRITY_FAILURE'
           }
+          $encoded = ($item.content -replace '\s','')
+          $bytes = [Convert]::FromBase64String($encoded)
+          $sealScript = Join-Path $env:RUNNER_TEMP 'trusted-sealer.ps1'
+          [IO.File]::WriteAllBytes($sealScript,$bytes)
+          [Array]::Clear($bytes,0,$bytes.Length)
           & $sealScript
+          Remove-Item -LiteralPath $sealScript -Force -ErrorAction SilentlyContinue
       - name: Publish encrypted evidence only
         if: ${{ always() && steps.seal.outputs.sealed == 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
