@@ -36,6 +36,13 @@ $exitCode = 1
 $actualHash = $null
 $sourceHashVerified = $false
 $os = $null
+$candidateUserName = "v" + [Guid]::NewGuid().ToString('N').Substring(0,12)
+$candidatePassword = $null
+$candidateSid = $null
+$candidateProfile = $null
+$candidateTemp = $null
+$firewallRuleNames = @()
+$stepOutputPath = $env:GITHUB_OUTPUT
 
 New-Item -ItemType Directory -Path $runRoot,$evidenceRoot -Force | Out-Null
 
@@ -67,6 +74,84 @@ function Stop-CandidateProcessTree {
     }
 }
 
+function Initialize-CandidateSandbox {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'SANDBOX_ADMIN_REQUIRED'
+    }
+
+    $profiles = @(Get-NetFirewallProfile -ErrorAction Stop)
+    if ($profiles.Count -lt 3 -or @($profiles | Where-Object { $_.Enabled -ne 'True' }).Count -gt 0) {
+        throw 'SANDBOX_FIREWALL_NOT_ENABLED'
+    }
+
+    $randomBytes = [byte[]]::new(48)
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($randomBytes) } finally { $rng.Dispose() }
+    $passwordText = [Convert]::ToBase64String($randomBytes) + 'Aa1!'
+    [Array]::Clear($randomBytes,0,$randomBytes.Length)
+    $script:candidatePassword = ConvertTo-SecureString -String $passwordText -AsPlainText -Force
+    $passwordText = $null
+
+    $newUser = New-LocalUser -Name $script:candidateUserName -Password $script:candidatePassword -Description 'Ephemeral isolated validation identity' -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword -ErrorAction Stop
+    $script:candidateSid = $newUser.SID.Value
+
+    $usersGroup = Get-LocalGroup -SID 'S-1-5-32-545' -ErrorAction Stop
+    $isStandardUser = @(Get-LocalGroupMember -Group $usersGroup.Name -ErrorAction Stop | Where-Object { $_.SID.Value -eq $script:candidateSid }).Count -gt 0
+    if (-not $isStandardUser) {
+        Add-LocalGroupMember -Group $usersGroup.Name -Member $script:candidateUserName -ErrorAction Stop
+    }
+
+    $adminsGroup = Get-LocalGroup -SID 'S-1-5-32-544' -ErrorAction Stop
+    $isAdministrator = @(Get-LocalGroupMember -Group $adminsGroup.Name -ErrorAction Stop | Where-Object { $_.SID.Value -eq $script:candidateSid }).Count -gt 0
+    if ($isAdministrator) { throw 'SANDBOX_CANDIDATE_USER_IS_ADMIN' }
+
+    $principalSddl = "D:(A;;GA;;;$($script:candidateSid))"
+    $suffix = [Guid]::NewGuid().ToString('N')
+    $outRule = "validation-candidate-egress-$suffix"
+    $inRule = "validation-candidate-ingress-$suffix"
+    $script:firewallRuleNames = @($outRule,$inRule)
+
+    New-NetFirewallRule -Name $outRule -DisplayName $outRule -Direction Outbound -Action Block -Profile Any -RemoteAddress Any -LocalUser $principalSddl -Enabled True -ErrorAction Stop | Out-Null
+    New-NetFirewallRule -Name $inRule -DisplayName $inRule -Direction Inbound -Action Block -Profile Any -RemoteAddress Any -LocalUser $principalSddl -Enabled True -ErrorAction Stop | Out-Null
+
+    $outRuleState = Get-NetFirewallRule -Name $outRule -ErrorAction Stop
+    $outSecurity = $outRuleState | Get-NetFirewallSecurityFilter -ErrorAction Stop
+    if ($outRuleState.Action -ne 'Block' -or $outRuleState.Enabled -ne 'True' -or $outRuleState.Direction -ne 'Outbound' -or -not ($outSecurity.LocalUser -match [Regex]::Escape($script:candidateSid))) {
+        throw 'SANDBOX_EGRESS_RULE_VERIFICATION_FAILED'
+    }
+
+    $script:candidateProfile = Join-Path $env:SystemDrive ("Users\" + $script:candidateUserName)
+    $script:candidateTemp = Join-Path $runRoot 'candidate-temp'
+    New-Item -ItemType Directory -Path $script:candidateProfile,$script:candidateTemp -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $script:candidateProfile 'AppData\Roaming'),(Join-Path $script:candidateProfile 'AppData\Local') -Force | Out-Null
+
+    $sidAceTraverse = "*$($script:candidateSid):(X)"
+    $sidAceModify = "*$($script:candidateSid):(OI)(CI)M"
+    $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+    & $icacls $env:RUNNER_TEMP /grant $sidAceTraverse /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_TEMP_TRAVERSE_ACL_FAILED' }
+    & $icacls $runRoot /grant $sidAceModify /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_RUNROOT_ACL_FAILED' }
+    & $icacls $script:candidateProfile /grant $sidAceModify /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_PROFILE_ACL_FAILED' }
+}
+
+function Remove-CandidateSandbox {
+    foreach ($ruleName in $script:firewallRuleNames) {
+        Remove-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+    }
+    $script:firewallRuleNames = @()
+    if ($script:candidateUserName) {
+        Remove-LocalUser -Name $script:candidateUserName -ErrorAction SilentlyContinue
+    }
+    if ($script:candidatePassword) {
+        $script:candidatePassword.Dispose()
+        $script:candidatePassword = $null
+    }
+}
+
 function Invoke-Captured {
     param(
         [Parameter(Mandatory=$true)][string]$Executable,
@@ -82,23 +167,44 @@ function Invoke-Captured {
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    $psi.UserName = $script:candidateUserName
+    $psi.Domain = $env:COMPUTERNAME
+    $psi.Password = $script:candidatePassword
+    $psi.LoadUserProfile = $true
 
     # Candidate code receives only operating-system and toolchain variables.
     # No GITHUB_*, ACTIONS_*, RUNNER_*, token, URL, hash, or encryption-key values.
     $safeEnvironment = @(
-        'PATH','PATHEXT','SystemRoot','WINDIR','TEMP','TMP','USERPROFILE',
-        'HOMEDRIVE','HOMEPATH','ProgramFiles','ProgramFiles(x86)','ProgramW6432',
-        'CommonProgramFiles','CommonProgramFiles(x86)','ProgramData','APPDATA',
-        'LOCALAPPDATA','ComSpec','PSModulePath','PROCESSOR_ARCHITECTURE',
-        'PROCESSOR_IDENTIFIER','NUMBER_OF_PROCESSORS','VSINSTALLDIR','VCINSTALLDIR',
-        'VCToolsInstallDir','VisualStudioVersion','WindowsSdkDir','WindowsSDKVersion',
-        'UniversalCRTSdkDir','UCRTVersion','INCLUDE','LIB','LIBPATH'
+        'PATH','PATHEXT','SystemRoot','WINDIR','ProgramFiles','ProgramFiles(x86)','ProgramW6432',
+        'CommonProgramFiles','CommonProgramFiles(x86)','ProgramData','ComSpec',
+        'PROCESSOR_ARCHITECTURE','PROCESSOR_IDENTIFIER','NUMBER_OF_PROCESSORS',
+        'VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsRedistDir',
+        'VisualStudioVersion','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir',
+        'UCRTVersion','INCLUDE','LIB','LIBPATH','VSCMD_VER','VSCMD_ARG_TGT_ARCH',
+        'VSCMD_ARG_HOST_ARCH','DevEnvDir','MSBuildExtensionsPath','MSBuildSDKsPath',
+        'DOTNET_ROOT','DOTNET_ROOT_X64','DOTNET_ROOT_X86'
     )
     $psi.Environment.Clear()
     foreach ($name in $safeEnvironment) {
         $value = [Environment]::GetEnvironmentVariable($name,'Process')
         if ($null -ne $value) { $psi.Environment[$name] = $value }
     }
+    $profileHome = $script:candidateProfile
+    $psi.Environment['USERNAME'] = $script:candidateUserName
+    $psi.Environment['USERDOMAIN'] = $env:COMPUTERNAME
+    $psi.Environment['USERPROFILE'] = $profileHome
+    $psi.Environment['HOME'] = $profileHome
+    $psi.Environment['HOMEDRIVE'] = $env:SystemDrive
+    $psi.Environment['HOMEPATH'] = $profileHome.Substring($env:SystemDrive.Length)
+    $psi.Environment['TEMP'] = $script:candidateTemp
+    $psi.Environment['TMP'] = $script:candidateTemp
+    $psi.Environment['APPDATA'] = Join-Path $profileHome 'AppDataRoaming'
+    $psi.Environment['LOCALAPPDATA'] = Join-Path $profileHome 'AppDataLocal'
+    $psi.Environment['PSModulePath'] = @(
+        (Join-Path $env:ProgramFiles 'PowerShellModules'),
+        (Join-Path $env:ProgramFiles 'WindowsPowerShellModules'),
+        (Join-Path $env:SystemRoot 'System32WindowsPowerShell1.0Modules')
+    ) -join ';'
 
     foreach ($argument in $Arguments) {
         [void]$psi.ArgumentList.Add([string]$argument)
@@ -156,13 +262,23 @@ try {
 
     Expand-Archive -LiteralPath $archivePath -DestinationPath $payloadRoot -Force
 
-    # Candidate code is launched only after all bootstrap secrets have been removed
-    # from this process environment. The evidence encryption key is supplied later
-    # to a separate trusted sealing step.
+    # Candidate code runs as a temporary standard user with user-scoped inbound
+    # and outbound network blocks. No checkout token or GitHub credential is used.
     foreach ($name in $secretEnvironmentNames) {
         [Environment]::SetEnvironmentVariable($name,$null,'Process')
         Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
     }
+    $sourceUrl = $null
+    $expectedHash = $null
+    $evidenceKeyB64 = $null
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    Initialize-CandidateSandbox
+
+    $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+    $egressProbe = '$client = $null; try { $client = [Net.Sockets.TcpClient]::new(); $a = $client.BeginConnect("1.1.1.1",443,$null,$null); if ($a.AsyncWaitHandle.WaitOne(2500) -and $client.Connected) { exit 23 }; exit 0 } catch { exit 0 } finally { if ($client) { $client.Dispose() } }'
+    $probeExit = Invoke-Captured -Executable $pwsh -Arguments @('-NoLogo','-NoProfile','-NonInteractive','-Command',$egressProbe) -LogPath (Join-Path $evidenceRoot 'network-isolation-probe.log')
+    if ($probeExit -ne 0) { throw 'SANDBOX_OUTBOUND_NETWORK_NOT_BLOCKED' }
 
     if ($Lane -eq '01') {
         $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'Invoke-*-WindowsMSVC.ps1' -File -Recurse)
@@ -173,7 +289,6 @@ try {
         $archiveCandidates = @(Get-ChildItem -LiteralPath $packageRoot -Filter '*_CANDIDATE_*.zip' -File)
         if ($archiveCandidates.Count -ne 1) { throw 'PACKAGE_INPUT_LAYOUT_INVALID' }
 
-        $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
         $exitCode = Invoke-Captured -Executable $pwsh -Arguments @(
             '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
             '-File',$runner,'-CandidateArchive',$archiveCandidates[0].FullName,
@@ -278,7 +393,9 @@ finally {
         Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
     }
     $sourceUrl = $null
+    $expectedHash = $null
     $evidenceKeyB64 = $null
+    Remove-CandidateSandbox
 
     $final = [ordered]@{
         schema = 'validation.gateway.execution.v2'
@@ -298,7 +415,7 @@ finally {
     }
     $final | ConvertTo-Json -Depth 8 |
         Set-Content -LiteralPath (Join-Path $evidenceRoot 'execution-result.json') -Encoding utf8
-    if ($env:GITHUB_OUTPUT) { Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("status={0}" -f $status) }
+    if ($stepOutputPath) { Add-Content -LiteralPath $stepOutputPath -Value ("status={0}" -f $status) }
 }
 
 if ($exitCode -ne 0) { exit 1 }
