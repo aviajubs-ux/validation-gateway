@@ -23,6 +23,56 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Validate lane secrets are configured
+        id: preflight
+        shell: pwsh
+        env:
+          LANE_SOURCE_URL: ${{ secrets[format('SOURCE_URL_{0}', inputs.lane)] }}
+          LANE_SOURCE_SHA256: ${{ secrets[format('SOURCE_SHA256_{0}', inputs.lane)] }}
+          LANE_EVIDENCE_KEY_B64: ${{ secrets[format('EVIDENCE_KEY_B64_{0}', inputs.lane)] }}
+        run: |
+          $lane = '${{ inputs.lane }}'
+          $required = @(
+            @{ Env = 'LANE_SOURCE_URL'; Secret = "SOURCE_URL_$lane" },
+            @{ Env = 'LANE_SOURCE_SHA256'; Secret = "SOURCE_SHA256_$lane" },
+            @{ Env = 'LANE_EVIDENCE_KEY_B64'; Secret = "EVIDENCE_KEY_B64_$lane" }
+          )
+          $missing = [System.Collections.Generic.List[string]]::new()
+          foreach ($item in $required) {
+            $value = [Environment]::GetEnvironmentVariable($item.Env)
+            if ([string]::IsNullOrWhiteSpace($value)) { $missing.Add($item.Secret) }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Output ('CONFIG_MISSING_SECRETS: ' + ($missing -join ', '))
+            Write-Output 'CONFIG_EXPECTED_SCOPE: environment brain-validation'
+            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 1
+          }
+
+          if ($env:LANE_SOURCE_URL -notmatch '^https://') {
+            Write-Output 'CONFIG_SOURCE_URL_INVALID: HTTPS_URL_REQUIRED'
+            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 1
+          }
+          if ($env:LANE_SOURCE_SHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+            Write-Output 'CONFIG_SOURCE_SHA256_INVALID'
+            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 1
+          }
+          try {
+            $keyBytes = [Convert]::FromBase64String($env:LANE_EVIDENCE_KEY_B64)
+            if ($keyBytes.Length -ne 32) { throw 'INVALID_LENGTH' }
+            [Array]::Clear($keyBytes,0,$keyBytes.Length)
+            $keyBytes = $null
+          } catch {
+            if ($keyBytes) { [Array]::Clear($keyBytes,0,$keyBytes.Length) }
+            Write-Output 'CONFIG_EVIDENCE_KEY_INVALID: EXPECTED_BASE64_32_BYTES'
+            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 1
+          }
+
+          "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Output 'LANE_CONFIGURATION_VALID'
       - name: Load pinned generic executor without repository credentials
         id: executor
         shell: pwsh
@@ -39,29 +89,6 @@ jobs:
           [Array]::Clear($bytes,0,$bytes.Length)
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("path={0}" -f $scriptPath)
           Write-Output 'TRUSTED_EXECUTOR_LOADED'
-      - name: Validate lane secrets are configured
-        id: preflight
-        shell: pwsh
-        env:
-          LANE_SOURCE_URL: ${{ secrets[format('SOURCE_URL_{0}', inputs.lane)] }}
-          LANE_SOURCE_SHA256: ${{ secrets[format('SOURCE_SHA256_{0}', inputs.lane)] }}
-          LANE_EVIDENCE_KEY_B64: ${{ secrets[format('EVIDENCE_KEY_B64_{0}', inputs.lane)] }}
-        run: |
-          $lane = '${{ inputs.lane }}'
-          $required = @('LANE_SOURCE_URL','LANE_SOURCE_SHA256','LANE_EVIDENCE_KEY_B64')
-          $missing = [System.Collections.Generic.List[string]]::new()
-          foreach ($name in $required) {
-            $value = [Environment]::GetEnvironmentVariable($name)
-            if ([string]::IsNullOrWhiteSpace($value)) { $missing.Add($name) }
-          }
-          if ($missing.Count -gt 0) {
-            Write-Output ('CONFIG_MISSING: ' + ($missing -join ', '))
-            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            exit 1
-          }
-          "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Output 'LANE_CONFIGURATION_PRESENT'
-
       - name: Execute isolated validation
         id: execute
         if: ${{ steps.preflight.outcome == 'success' && steps.executor.outcome == 'success' }}
@@ -80,7 +107,7 @@ jobs:
           & $executorPath -Lane $lane
       - name: Seal evidence
         id: seal
-        if: ${{ always() && steps.preflight.outcome == 'success' }}
+        if: ${{ always() && steps.preflight.outcome == 'success' && steps.executor.outcome == 'success' }}
         shell: pwsh
         env:
           LANE_EVIDENCE_KEY_B64: ${{ secrets[format('EVIDENCE_KEY_B64_{0}', inputs.lane)] }}
