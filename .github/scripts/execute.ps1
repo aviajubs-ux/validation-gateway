@@ -13,6 +13,7 @@ $runRoot = Join-Path $env:RUNNER_TEMP 'validation'
 $payloadRoot = Join-Path $runRoot 'payload'
 $evidenceRoot = Join-Path $runRoot 'evidence'
 $buildRoot = Join-Path $runRoot 'build'
+$candidateOutputRoot = Join-Path $runRoot 'candidate-output'
 $archivePath = Join-Path $runRoot 'source.zip'
 
 # Read bootstrap inputs once. Never pass these values to any candidate process.
@@ -44,7 +45,7 @@ $candidateTemp = $null
 $firewallRuleNames = @()
 $stepOutputPath = $env:GITHUB_OUTPUT
 
-New-Item -ItemType Directory -Path $runRoot,$evidenceRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $runRoot,$evidenceRoot,$candidateOutputRoot -Force | Out-Null
 
 function Stop-CandidateProcessTree {
     param([Parameter(Mandatory=$true)][int]$RootProcessId)
@@ -131,8 +132,37 @@ function Initialize-CandidateSandbox {
     $icacls = Join-Path $env:SystemRoot 'System32/icacls.exe'
     & $icacls $env:RUNNER_TEMP /grant $sidAceTraverse /Q | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_TEMP_TRAVERSE_ACL_FAILED' }
-    & $icacls $runRoot /grant $sidAceModify /T /C /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_RUNROOT_ACL_FAILED' }
+    # Candidate may traverse the scratch root but must not modify trusted evidence,
+    # bootstrap inputs, encryption outputs, or the runner's result files.
+    & $icacls $runRoot /grant $sidAceTraverse /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_RUNROOT_TRAVERSE_ACL_FAILED' }
+    foreach ($writablePath in @($payloadRoot,$buildRoot,$candidateOutputRoot,$script:candidateTemp)) {
+        New-Item -ItemType Directory -Path $writablePath -Force | Out-Null
+        & $icacls $writablePath /grant $sidAceModify /T /C /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_SCOPED_WRITE_ACL_FAILED' }
+    }
+}
+
+function Copy-CandidateEvidenceSafely {
+    if (-not (Test-Path -LiteralPath $candidateOutputRoot -PathType Container)) { return }
+    $root = [IO.Path]::GetFullPath($candidateOutputRoot).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $items = @(Get-ChildItem -LiteralPath $candidateOutputRoot -Recurse -Force -ErrorAction Stop)
+    if ($items.Count -gt 10000) { throw 'CANDIDATE_EVIDENCE_FILE_COUNT_LIMIT' }
+    $totalBytes = [int64]0
+    foreach ($item in $items) {
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'CANDIDATE_EVIDENCE_REPARSE_POINT_REJECTED' }
+        if ($item.PSIsContainer) { continue }
+        if ($item.Length -gt 50MB) { throw 'CANDIDATE_EVIDENCE_FILE_SIZE_LIMIT' }
+        $totalBytes += [int64]$item.Length
+        if ($totalBytes -gt 200MB) { throw 'CANDIDATE_EVIDENCE_TOTAL_SIZE_LIMIT' }
+        $full = [IO.Path]::GetFullPath($item.FullName)
+        if (-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) { throw 'CANDIDATE_EVIDENCE_PATH_ESCAPE' }
+        $relative = $full.Substring($root.Length)
+        $destination = Join-Path $evidenceRoot $relative
+        $destinationParent = Split-Path -Parent $destination
+        New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null
+        [IO.File]::Copy($full,$destination,$true)
+    }
 }
 
 function Remove-CandidateSandbox {
@@ -289,8 +319,9 @@ try {
         $exitCode = Invoke-Captured -Executable $pwsh -Arguments @(
             '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
             '-File',$runner,'-CandidateArchive',$archiveCandidates[0].FullName,
-            '-EvidenceParent',$evidenceRoot,'-Configuration','Release','-Parallel','2'
+            '-EvidenceParent',$candidateOutputRoot,'-Configuration','Release','-Parallel','2'
         ) -LogPath (Join-Path $evidenceRoot 'candidate-runner.log') -WorkingDirectory $packageRoot
+        Copy-CandidateEvidenceSafely
 
         if ($exitCode -eq 0) { $status = 'PASS_LANE_01_CANDIDATE_VALIDATION' }
         else { $status = 'FAIL_LANE_01_CANDIDATE_VALIDATION' }
@@ -328,9 +359,10 @@ try {
 
         $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
             '--test-dir',$buildRoot,'-C','Release','--output-on-failure','--verbose',
-            '--parallel','2','--timeout','300','--output-junit',(Join-Path $evidenceRoot 'ctest-junit.xml')
+            '--parallel','2','--timeout','300','--output-junit',(Join-Path $candidateOutputRoot 'ctest-junit.xml')
         ) -LogPath (Join-Path $evidenceRoot 'ctest-execution.log')
 
+        Copy-CandidateEvidenceSafely
         if ($exitCode -eq 0) { $status = 'PASS_LANE_02_BUILD_AND_TESTS' }
         else { $status = 'FAIL_LANE_02_BUILD_OR_TESTS' }
     }
@@ -362,11 +394,12 @@ try {
         }
         else {
             $python = (Get-Command python.exe -ErrorAction Stop).Source
-            $laneOutputEvidence = Join-Path $evidenceRoot 'system'
+            $laneOutputEvidence = $candidateOutputRoot
             New-Item -ItemType Directory -Path $laneOutputEvidence -Force | Out-Null
             $exitCode = Invoke-Captured -Executable $python -Arguments @(
                 $runner,'--project-root',$projectRoot,'--output-dir',$laneOutputEvidence
             ) -LogPath (Join-Path $evidenceRoot 'system-launch.log') -WorkingDirectory $projectRoot
+            Copy-CandidateEvidenceSafely
 
             if ($exitCode -eq 0) { $status = 'PASS_LANE_03_PLATFORM_VALIDATION' }
             else { $status = 'FAIL_OR_PARTIAL_LANE_03_PLATFORM_VALIDATION' }
