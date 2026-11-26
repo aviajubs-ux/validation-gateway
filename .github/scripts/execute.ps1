@@ -1,9 +1,16 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)]
     [ValidateSet('01','02','03')]
-    [string]$Lane
+    [string]$Lane,
+    [switch]$SelfTest
 )
+
+if (-not $SelfTest -and [string]::IsNullOrWhiteSpace($Lane)) {
+    throw 'LANE_REQUIRED'
+}
+if ($SelfTest -and -not [string]::IsNullOrWhiteSpace($Lane)) {
+    throw 'SELFTEST_LANE_NOT_ALLOWED'
+}
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -46,6 +53,170 @@ $firewallRuleNames = @()
 $stepOutputPath = $env:GITHUB_OUTPUT
 
 New-Item -ItemType Directory -Path $runRoot,$evidenceRoot,$candidateOutputRoot -Force | Out-Null
+
+
+# Bounded concurrent pipe capture. The readers continue draining the pipes while
+# retaining at most the configured characters per stream. The first overflow or
+# timeout terminates the complete process tree before the script reports failure.
+if ($null -eq ('Teli.Validation.BoundedProcessCapture' -as [type])) {
+    $boundedCaptureSource = @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Teli.Validation
+{
+    public sealed class BoundedProcessCaptureResult
+    {
+        public string StandardOutput { get; set; }
+        public string StandardError { get; set; }
+        public bool TimedOut { get; set; }
+        public bool OutputLimitExceeded { get; set; }
+        public bool ReaderCleanupFailed { get; set; }
+    }
+
+    public static class BoundedProcessCapture
+    {
+        public static BoundedProcessCaptureResult WaitForExit(
+            Process process,
+            int timeoutMilliseconds,
+            int maximumCharactersPerStream)
+        {
+            if (process == null || timeoutMilliseconds < 1 ||
+                maximumCharactersPerStream < 1024)
+            {
+                throw new ArgumentOutOfRangeException("Invalid capture limits.");
+            }
+
+            int exceeded = 0;
+            Action onExceeded = () => Interlocked.Exchange(ref exceeded, 1);
+            Task<string> stdoutTask = CaptureAsync(
+                process.StandardOutput, maximumCharactersPerStream, onExceeded);
+            Task<string> stderrTask = CaptureAsync(
+                process.StandardError, maximumCharactersPerStream, onExceeded);
+
+            var timer = Stopwatch.StartNew();
+            bool timedOut = false;
+            bool outputLimitExceeded = false;
+
+            while (!process.HasExited)
+            {
+                if (Volatile.Read(ref exceeded) != 0)
+                {
+                    outputLimitExceeded = true;
+                    break;
+                }
+                if (timer.ElapsedMilliseconds >= timeoutMilliseconds)
+                {
+                    timedOut = true;
+                    break;
+                }
+                Thread.Sleep(20);
+            }
+
+            if (timedOut || outputLimitExceeded)
+            {
+                try
+                {
+                    if (!process.HasExited) process.Kill(true);
+                }
+                catch
+                {
+                    if (!process.HasExited)
+                        throw new InvalidOperationException("CANDIDATE_PROCESS_TREE_KILL_FAILED");
+                }
+
+                if (!process.WaitForExit(5000))
+                {
+                    try { process.Kill(true); } catch { }
+                    if (!process.WaitForExit(5000))
+                        throw new InvalidOperationException("CANDIDATE_PROCESS_DID_NOT_EXIT");
+                }
+            }
+            else
+            {
+                process.WaitForExit();
+            }
+
+            bool readersCompleted = false;
+            try
+            {
+                readersCompleted = Task.WaitAll(
+                    new Task[] { stdoutTask, stderrTask }, 5000);
+            }
+            catch
+            {
+                readersCompleted = stdoutTask.IsCompleted && stderrTask.IsCompleted;
+            }
+
+            if (!readersCompleted)
+            {
+                try { process.StandardOutput.Close(); } catch { }
+                try { process.StandardError.Close(); } catch { }
+                try
+                {
+                    readersCompleted = Task.WaitAll(
+                        new Task[] { stdoutTask, stderrTask }, 5000);
+                }
+                catch
+                {
+                    readersCompleted = stdoutTask.IsCompleted && stderrTask.IsCompleted;
+                }
+            }
+
+            if (!readersCompleted)
+                throw new InvalidOperationException("CANDIDATE_OUTPUT_READER_DID_NOT_STOP");
+
+            return new BoundedProcessCaptureResult
+            {
+                StandardOutput = stdoutTask.GetAwaiter().GetResult(),
+                StandardError = stderrTask.GetAwaiter().GetResult(),
+                TimedOut = timedOut,
+                OutputLimitExceeded = outputLimitExceeded || Volatile.Read(ref exceeded) != 0,
+                ReaderCleanupFailed = false
+            };
+        }
+
+        private static async Task<string> CaptureAsync(
+            TextReader reader,
+            int maximumCharacters,
+            Action onExceeded)
+        {
+            char[] buffer = new char[8192];
+            var retained = new StringBuilder(Math.Min(maximumCharacters, 65536));
+            int stored = 0;
+
+            try
+            {
+                while (true)
+                {
+                    int count = await reader.ReadAsync(
+                        buffer, 0, buffer.Length).ConfigureAwait(false);
+                    if (count == 0) break;
+
+                    int remaining = Math.Max(0, maximumCharacters - stored);
+                    int keep = Math.Min(count, remaining);
+                    if (keep > 0)
+                    {
+                        retained.Append(buffer, 0, keep);
+                        stored += keep;
+                    }
+                    if (keep < count) onExceeded();
+                }
+            }
+            catch (ObjectDisposedException) { }
+            catch (IOException) { }
+
+            return retained.ToString();
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $boundedCaptureSource -Language CSharp
+}
 
 function Stop-CandidateProcessTree {
     param([Parameter(Mandatory=$true)][int]$RootProcessId)
@@ -184,8 +355,17 @@ function Invoke-Captured {
         [Parameter(Mandatory=$true)][string]$Executable,
         [Parameter(Mandatory=$true)][string[]]$Arguments,
         [Parameter(Mandatory=$true)][string]$LogPath,
-        [string]$WorkingDirectory = $runRoot
+        [string]$WorkingDirectory = $runRoot,
+        [ValidateRange(1,18000)][int]$TimeoutSeconds = 1800,
+        [ValidateRange(1024,16777216)][int]$MaxOutputCharsPerStream = 8388608
     )
+
+    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
+        throw 'CANDIDATE_EXECUTABLE_NOT_FOUND'
+    }
+    if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
+        throw 'CANDIDATE_WORKING_DIRECTORY_NOT_FOUND'
+    }
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $Executable
@@ -194,10 +374,15 @@ function Invoke-Captured {
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
-    $psi.UserName = $script:candidateUserName
-    $psi.Domain = $env:COMPUTERNAME
-    $psi.Password = $script:candidatePassword
-    $psi.LoadUserProfile = $true
+
+    # Start as the isolated temporary identity for validation runs.
+    # Self-tests deliberately use the current hosted-runner identity and no secrets.
+    if ($null -ne $script:candidatePassword -and -not [string]::IsNullOrWhiteSpace($script:candidateUserName)) {
+        $psi.UserName = $script:candidateUserName
+        $psi.Domain = $env:COMPUTERNAME
+        $psi.Password = $script:candidatePassword
+        $psi.LoadUserProfile = $true
+    }
 
     # Candidate code receives only operating-system and toolchain variables.
     # No GITHUB_*, ACTIONS_*, RUNNER_*, token, URL, hash, or encryption-key values.
@@ -216,15 +401,22 @@ function Invoke-Captured {
         $value = [Environment]::GetEnvironmentVariable($name,'Process')
         if ($null -ne $value) { $psi.Environment[$name] = $value }
     }
+
     $profileHome = $script:candidateProfile
-    $psi.Environment['USERNAME'] = $script:candidateUserName
+    if ([string]::IsNullOrWhiteSpace($profileHome)) { $profileHome = $env:USERPROFILE }
+    $effectiveUserName = $script:candidateUserName
+    if ([string]::IsNullOrWhiteSpace($effectiveUserName)) { $effectiveUserName = [Environment]::UserName }
+    $effectiveTemp = $script:candidateTemp
+    if ([string]::IsNullOrWhiteSpace($effectiveTemp)) { $effectiveTemp = $env:TEMP }
+
+    $psi.Environment['USERNAME'] = $effectiveUserName
     $psi.Environment['USERDOMAIN'] = $env:COMPUTERNAME
     $psi.Environment['USERPROFILE'] = $profileHome
     $psi.Environment['HOME'] = $profileHome
     $psi.Environment['HOMEDRIVE'] = $env:SystemDrive
     $psi.Environment['HOMEPATH'] = $profileHome.Substring($env:SystemDrive.Length)
-    $psi.Environment['TEMP'] = $script:candidateTemp
-    $psi.Environment['TMP'] = $script:candidateTemp
+    $psi.Environment['TEMP'] = $effectiveTemp
+    $psi.Environment['TMP'] = $effectiveTemp
     $psi.Environment['APPDATA'] = Join-Path $profileHome 'AppData/Roaming'
     $psi.Environment['LOCALAPPDATA'] = Join-Path $profileHome 'AppData/Local'
     $psi.Environment['PSModulePath'] = @(
@@ -239,21 +431,29 @@ function Invoke-Captured {
 
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $psi
-    $stdoutTask = $null
-    $stderrTask = $null
     $processId = 0
 
     try {
         if (-not $process.Start()) { throw 'CANDIDATE_PROCESS_START_FAILED' }
         $processId = $process.Id
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
 
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
-        $combined = $stdout + [Environment]::NewLine + '--- STDERR ---' + [Environment]::NewLine + $stderr
-        [System.IO.File]::WriteAllText($LogPath,$combined,[System.Text.UTF8Encoding]::new($false))
+        $capture = [Teli.Validation.BoundedProcessCapture]::WaitForExit(
+            $process,
+            [int]($TimeoutSeconds * 1000),
+            $MaxOutputCharsPerStream
+        )
+
+        $utf8 = [System.Text.UTF8Encoding]::new($false)
+        [System.IO.File]::WriteAllText(($LogPath + '.stdout.log'),$capture.StandardOutput,$utf8)
+        [System.IO.File]::WriteAllText(($LogPath + '.stderr.log'),$capture.StandardError,$utf8)
+        $combined = $capture.StandardOutput + [Environment]::NewLine +
+            '--- STDERR ---' + [Environment]::NewLine + $capture.StandardError
+        [System.IO.File]::WriteAllText($LogPath,$combined,$utf8)
+
+        if ($capture.OutputLimitExceeded) { throw 'CANDIDATE_OUTPUT_LIMIT_EXCEEDED' }
+        if ($capture.TimedOut) { throw 'CANDIDATE_PROCESS_TIMEOUT' }
+        if ($capture.ReaderCleanupFailed) { throw 'CANDIDATE_OUTPUT_READER_INCOMPLETE' }
+
         return [int]$process.ExitCode
     }
     finally {
@@ -262,6 +462,99 @@ function Invoke-Captured {
         }
         $process.Dispose()
         $psi = $null
+    }
+}
+
+
+if ($SelfTest) {
+    $selfTestRoot = Join-Path $env:RUNNER_TEMP ("validation-gateway-selftest-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $selfTestRoot -Force | Out-Null
+    $script:candidateUserName = $null
+    $script:candidatePassword = $null
+    $script:candidateProfile = $env:USERPROFILE
+    $script:candidateTemp = Join-Path $selfTestRoot 'temp'
+    New-Item -ItemType Directory -Path $script:candidateTemp -Force | Out-Null
+    $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+
+    try {
+        $streamLog = Join-Path $selfTestRoot 'streams.log'
+        $streamCode = '[Console]::Out.Write("STDOUT_SENTINEL"); [Console]::Error.Write("STDERR_SENTINEL"); exit 0'
+        $streamExit = Invoke-Captured -Executable $pwsh -Arguments @(
+            '-NoLogo','-NoProfile','-NonInteractive','-Command',$streamCode
+        ) -LogPath $streamLog -WorkingDirectory $selfTestRoot -TimeoutSeconds 15 -MaxOutputCharsPerStream 4096
+        $capturedOut = [IO.File]::ReadAllText($streamLog + '.stdout.log')
+        $capturedErr = [IO.File]::ReadAllText($streamLog + '.stderr.log')
+        if ($streamExit -ne 0 -or $capturedOut -ne 'STDOUT_SENTINEL' -or $capturedErr -ne 'STDERR_SENTINEL') {
+            throw 'SELFTEST_STDOUT_STDERR_ISOLATION_FAILED'
+        }
+        Write-Output 'SELFTEST_PASS_STDOUT_STDERR'
+
+        $exitCode = Invoke-Captured -Executable $pwsh -Arguments @(
+            '-NoLogo','-NoProfile','-NonInteractive','-Command','exit 17'
+        ) -LogPath (Join-Path $selfTestRoot 'exit-code.log') -WorkingDirectory $selfTestRoot -TimeoutSeconds 15
+        if ($exitCode -ne 17) { throw 'SELFTEST_EXIT_CODE_NOT_PRESERVED' }
+        Write-Output 'SELFTEST_PASS_EXIT_CODE'
+
+        $timeoutObserved = $false
+        try {
+            [void](Invoke-Captured -Executable $pwsh -Arguments @(
+                '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30'
+            ) -LogPath (Join-Path $selfTestRoot 'timeout.log') -WorkingDirectory $selfTestRoot -TimeoutSeconds 2 -MaxOutputCharsPerStream 4096)
+        } catch {
+            if ($_.Exception.Message -eq 'CANDIDATE_PROCESS_TIMEOUT') { $timeoutObserved = $true } else { throw }
+        }
+        if (-not $timeoutObserved) { throw 'SELFTEST_TIMEOUT_NOT_ENFORCED' }
+        Write-Output 'SELFTEST_PASS_TIMEOUT'
+
+        $outputLimitObserved = $false
+        try {
+            $floodCode = '$x = "0123456789" * 100000; [Console]::Out.Write($x); [Console]::Out.Flush(); Start-Sleep -Seconds 30'
+            [void](Invoke-Captured -Executable $pwsh -Arguments @(
+                '-NoLogo','-NoProfile','-NonInteractive','-Command',$floodCode
+            ) -LogPath (Join-Path $selfTestRoot 'output-limit.log') -WorkingDirectory $selfTestRoot -TimeoutSeconds 15 -MaxOutputCharsPerStream 4096)
+        } catch {
+            if ($_.Exception.Message -eq 'CANDIDATE_OUTPUT_LIMIT_EXCEEDED') { $outputLimitObserved = $true } else { throw }
+        }
+        if (-not $outputLimitObserved) { throw 'SELFTEST_OUTPUT_LIMIT_NOT_ENFORCED' }
+        Write-Output 'SELFTEST_PASS_OUTPUT_LIMIT'
+
+        $childPidFile = Join-Path $selfTestRoot 'child.pid'
+        $childScriptTemplate = '$child = Start-Process -FilePath ''{0}'' -ArgumentList @(''-NoLogo'',''-NoProfile'',''-Command'',''Start-Sleep -Seconds 60'') -PassThru -WindowStyle Hidden; [IO.File]::WriteAllText(''{1}'',[string]$child.Id); Start-Sleep -Seconds 60'
+        $childScript = $childScriptTemplate -f $pwsh.Replace("'","''"),$childPidFile.Replace("'","''")
+        $treeTimeoutObserved = $false
+        try {
+            [void](Invoke-Captured -Executable $pwsh -Arguments @(
+                '-NoLogo','-NoProfile','-NonInteractive','-Command',$childScript
+            ) -LogPath (Join-Path $selfTestRoot 'process-tree.log') -WorkingDirectory $selfTestRoot -TimeoutSeconds 3 -MaxOutputCharsPerStream 4096)
+        } catch {
+            if ($_.Exception.Message -eq 'CANDIDATE_PROCESS_TIMEOUT') { $treeTimeoutObserved = $true } else { throw }
+        }
+        if (-not $treeTimeoutObserved -or -not (Test-Path -LiteralPath $childPidFile)) {
+            throw 'SELFTEST_PROCESS_TREE_FIXTURE_FAILED'
+        }
+        $childPid = [int](Get-Content -LiteralPath $childPidFile -Raw)
+        $childAlive = $false
+        for ($i = 0; $i -lt 10; $i++) {
+            if (Get-Process -Id $childPid -ErrorAction SilentlyContinue) {
+                Start-Sleep -Milliseconds 200
+            } else {
+                $childAlive = $false
+                break
+            }
+            $childAlive = $true
+        }
+        if ($childAlive) { throw 'SELFTEST_DESCENDANT_SURVIVED_TIMEOUT' }
+        Write-Output 'SELFTEST_PASS_PROCESS_TREE_CLEANUP'
+        Write-Output 'VALIDATION_GATEWAY_SELFTEST_PASS'
+        exit 0
+    }
+    finally {
+        if (Test-Path -LiteralPath $selfTestRoot) {
+            Remove-Item -LiteralPath $selfTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $runRoot) {
+            Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -304,7 +597,7 @@ try {
 
     $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
     $egressProbe = '$client = $null; try { $client = [Net.Sockets.TcpClient]::new(); $a = $client.BeginConnect("1.1.1.1",443,$null,$null); if ($a.AsyncWaitHandle.WaitOne(2500) -and $client.Connected) { exit 23 }; exit 0 } catch { exit 0 } finally { if ($client) { $client.Dispose() } }'
-    $probeExit = Invoke-Captured -Executable $pwsh -Arguments @('-NoLogo','-NoProfile','-NonInteractive','-Command',$egressProbe) -LogPath (Join-Path $evidenceRoot 'network-isolation-probe.log')
+    $probeExit = Invoke-Captured -Executable $pwsh -Arguments @('-NoLogo','-NoProfile','-NonInteractive','-Command',$egressProbe) -LogPath (Join-Path $evidenceRoot 'network-isolation-probe.log') -TimeoutSeconds 10 -MaxOutputCharsPerStream 4096
     if ($probeExit -ne 0) { throw 'SANDBOX_OUTBOUND_NETWORK_NOT_BLOCKED' }
 
     if ($Lane -eq '01') {
@@ -320,7 +613,7 @@ try {
             '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
             '-File',$runner,'-CandidateArchive',$archiveCandidates[0].FullName,
             '-EvidenceParent',$candidateOutputRoot,'-Configuration','Release','-Parallel','2'
-        ) -LogPath (Join-Path $evidenceRoot 'candidate-runner.log') -WorkingDirectory $packageRoot
+        ) -LogPath (Join-Path $evidenceRoot 'candidate-runner.log') -WorkingDirectory $packageRoot -TimeoutSeconds 14400
         Copy-CandidateEvidenceSafely
 
         if ($exitCode -eq 0) { $status = 'PASS_LANE_01_CANDIDATE_VALIDATION' }
@@ -343,24 +636,24 @@ try {
             '-S',$sourceRoot,'-B',$buildRoot,
             '-DBUILD_TESTING=ON',
             '-DCMAKE_CONFIGURATION_TYPES=Release'
-        ) -LogPath (Join-Path $evidenceRoot 'configure.log')
+        ) -LogPath (Join-Path $evidenceRoot 'configure.log') -TimeoutSeconds 300
         if ($exitCode -ne 0) { throw 'BUILD_CONFIGURE_FAILED' }
 
         $exitCode = Invoke-Captured -Executable $cmake -Arguments @(
             '--build',$buildRoot,'--config','Release','--parallel','2','--target','ALL_BUILD'
-        ) -LogPath (Join-Path $evidenceRoot 'build.log')
+        ) -LogPath (Join-Path $evidenceRoot 'build.log') -TimeoutSeconds 10800
         if ($exitCode -ne 0) { throw 'FULL_BUILD_FAILED' }
 
         $ctest = (Get-Command ctest.exe -ErrorAction Stop).Source
         $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
             '--test-dir',$buildRoot,'-C','Release','-N'
-        ) -LogPath (Join-Path $evidenceRoot 'test-discovery.log')
+        ) -LogPath (Join-Path $evidenceRoot 'test-discovery.log') -TimeoutSeconds 300
         if ($exitCode -ne 0) { throw 'TEST_DISCOVERY_FAILED' }
 
         $exitCode = Invoke-Captured -Executable $ctest -Arguments @(
             '--test-dir',$buildRoot,'-C','Release','--output-on-failure','--verbose',
             '--parallel','2','--timeout','300','--output-junit',(Join-Path $candidateOutputRoot 'ctest-junit.xml')
-        ) -LogPath (Join-Path $evidenceRoot 'ctest-execution.log')
+        ) -LogPath (Join-Path $evidenceRoot 'ctest-execution.log') -TimeoutSeconds 14400
 
         Copy-CandidateEvidenceSafely
         if ($exitCode -eq 0) { $status = 'PASS_LANE_02_BUILD_AND_TESTS' }
@@ -402,7 +695,7 @@ try {
             $runnerLog = Join-Path $evidenceRoot 'windows-client-launch.log'
             $runnerExit = Invoke-Captured -Executable $python -Arguments @(
                 $runner,'--project-root',$projectRoot,'--output-dir',$runnerOutput
-            ) -LogPath $runnerLog -WorkingDirectory $projectRoot
+            ) -LogPath $runnerLog -WorkingDirectory $projectRoot -TimeoutSeconds 1800
 
             $runnerStatus = 'RESULT_UNAVAILABLE'
             $testCounts = $null
