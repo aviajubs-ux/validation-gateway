@@ -34,6 +34,7 @@ foreach ($name in $secretEnvironmentNames) {
 $status = 'BLOCKED'
 $exitCode = 1
 $actualHash = $null
+$sourceHashVerified = $false
 $os = $null
 
 New-Item -ItemType Directory -Path $runRoot,$evidenceRoot -Force | Out-Null
@@ -150,6 +151,7 @@ try {
 
     $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actualHash -ne $expectedHash.ToLowerInvariant()) { throw 'SOURCE_SHA256_MISMATCH' }
+    $sourceHashVerified = $true
     $expectedHash = $null
 
     Expand-Archive -LiteralPath $archivePath -DestinationPath $payloadRoot -Force
@@ -284,7 +286,7 @@ finally {
         status = $status
         exit_code = $exitCode
         source_sha256_actual = $actualHash
-        source_sha256_verified = ($null -ne $actualHash)
+        source_sha256_verified = $sourceHashVerified
         operating_system = if ($os) { $os.Caption } else { 'UNKNOWN' }
         os_build = if ($os) { $os.BuildNumber } else { 'UNKNOWN' }
         os_product_type = if ($os) { $os.ProductType } else { 'UNKNOWN' }
