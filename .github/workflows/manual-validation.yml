@@ -57,9 +57,9 @@ jobs:
         if: ${{ steps.preflight.outcome == 'success' }}
         shell: pwsh
         run: |
-          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=8b5ed5710457b8d99ba13f87a0fbc62e8606e73f'
+          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=bd82e6b951b21aa5c8d134d159cd86c8f100eb32'
           $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
-          if ($item.sha -ne '7de22c48241692cc54e4a2f6ecc0df1a0ca09204' -or $item.encoding -ne 'base64') {
+          if ($item.sha -ne '8d4aaef31b658ab6525885e3aabf5646a0b361b4' -or $item.encoding -ne 'base64') {
             throw 'TRUSTED_EXECUTOR_INTEGRITY_FAILURE'
           }
           $encoded = ($item.content -replace '\s','')
@@ -109,7 +109,7 @@ jobs:
           foreach ($suffix in '01','02','03') {
             [Environment]::SetEnvironmentVariable("EVIDENCE_KEY_B64_$suffix",$null,'Process')
           }
-          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/seal.ps1?ref=8b5ed5710457b8d99ba13f87a0fbc62e8606e73f'
+          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/seal.ps1?ref=bd82e6b951b21aa5c8d134d159cd86c8f100eb32'
           $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
           if ($item.sha -ne 'd46036edbfb8a3866336eb10d6289caf0bb4c7ff' -or $item.encoding -ne 'base64') {
             throw 'TRUSTED_SEAL_SCRIPT_INTEGRITY_FAILURE'
