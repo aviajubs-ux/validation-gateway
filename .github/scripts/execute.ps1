@@ -367,11 +367,27 @@ try {
         else { $status = 'FAIL_LANE_02_BUILD_OR_TESTS' }
     }
     else {
-        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'run_*_integration_windows.py' -File -Recurse)
-        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+        # Candidate R3 contains two intentional Windows entrypoints. Resolve each exact
+        # filename once; never use a wildcard that can become ambiguous as the package grows.
+        $runnerNames = @(
+            'run_stage70_a_b_integration_windows.py',
+            'run_guardian6_r3_integration_windows.py'
+        )
+        $runnerPaths = @{}
+        foreach ($runnerName in $runnerNames) {
+            $matches = @(Get-ChildItem -LiteralPath $payloadRoot -Filter $runnerName -File -Recurse)
+            if ($matches.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+            $runnerPaths[$runnerName] = $matches[0].FullName
+        }
 
-        $runner = $runnerCandidates[0].FullName
-        $projectRoot = $runnerCandidates[0].Directory.Parent.FullName
+        $projectRoot = (Get-Item -LiteralPath $runnerPaths[$runnerNames[0]]).Directory.Parent.FullName
+        foreach ($runnerName in $runnerNames) {
+            $runnerProjectRoot = (Get-Item -LiteralPath $runnerPaths[$runnerName]).Directory.Parent.FullName
+            if (-not [string]::Equals($runnerProjectRoot,$projectRoot,[StringComparison]::OrdinalIgnoreCase)) {
+                throw 'PACKAGE_ENTRYPOINT_ROOT_MISMATCH'
+            }
+        }
+
         $requiredSourceRoot = Join-Path $projectRoot 'source/active'
         if (!(Test-Path -LiteralPath $requiredSourceRoot -PathType Container)) {
             throw 'PACKAGE_SOURCE_LAYOUT_INVALID'
@@ -382,11 +398,11 @@ try {
             $exitCode = 0
             $platformEvidence = [ordered]@{
                 status = $status
-                os_caption = $os.Caption
                 os_build = $os.BuildNumber
                 product_type = $os.ProductType
                 required_client_os_proof = $false
                 tests_executed = 0
+                runner_entrypoints = @('run_stage70_a_b_integration_windows.py','run_guardian6_r3_integration_windows.py')
                 reason = 'The hosted runner is not a supported Windows client OS; no client-OS security tests were executed.'
             }
             $platformEvidence | ConvertTo-Json -Depth 5 |
@@ -394,15 +410,88 @@ try {
         }
         else {
             $python = (Get-Command python.exe -ErrorAction Stop).Source
-            $laneOutputEvidence = $candidateOutputRoot
-            New-Item -ItemType Directory -Path $laneOutputEvidence -Force | Out-Null
-            $exitCode = Invoke-Captured -Executable $python -Arguments @(
-                $runner,'--project-root',$projectRoot,'--output-dir',$laneOutputEvidence
-            ) -LogPath (Join-Path $evidenceRoot 'system-launch.log') -WorkingDirectory $projectRoot
-            Copy-CandidateEvidenceSafely
+            $runnerResults = [System.Collections.Generic.List[object]]::new()
+            $runnerSpecs = @(
+                @{
+                    Name = 'stage70_ab'
+                    File = $runnerNames[0]
+                    ResultFile = 'STAGE70_AB_WINDOWS_RESULT.json'
+                },
+                @{
+                    Name = 'r3_lifecycle'
+                    File = $runnerNames[1]
+                    ResultFile = 'WINDOWS_LIFECYCLE_RESULT.json'
+                }
+            )
 
-            if ($exitCode -eq 0) { $status = 'PASS_LANE_03_PLATFORM_VALIDATION' }
-            else { $status = 'FAIL_OR_PARTIAL_LANE_03_PLATFORM_VALIDATION' }
+            foreach ($spec in $runnerSpecs) {
+                $runnerOutput = Join-Path $candidateOutputRoot $spec.Name
+                New-Item -ItemType Directory -Path $runnerOutput -Force | Out-Null
+                $runnerLog = Join-Path $evidenceRoot ($spec.Name + '-launch.log')
+                $runnerExit = Invoke-Captured -Executable $python -Arguments @(
+                    $runnerPaths[$spec.File],
+                    '--project-root',$projectRoot,
+                    '--output-dir',$runnerOutput
+                ) -LogPath $runnerLog -WorkingDirectory $projectRoot
+
+                $runnerStatus = 'RESULT_UNAVAILABLE'
+                $testCounts = $null
+                $resultPath = Join-Path $runnerOutput $spec.ResultFile
+                if ((Test-Path -LiteralPath $resultPath -PathType Leaf) -and (Get-Item -LiteralPath $resultPath).Length -le 5MB) {
+                    try {
+                        $runnerDocument = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                        if ($runnerDocument.status -is [string] -and $runnerDocument.status -match '^[A-Z0-9_]+$') {
+                            $runnerStatus = $runnerDocument.status
+                        }
+                        if ($spec.Name -eq 'stage70_ab') {
+                            $testCounts = [ordered]@{
+                                total = [int]$runnerDocument.tests_executed
+                                passed = [int]$runnerDocument.passed
+                                skipped = [int]$runnerDocument.skipped
+                                failures = [int]$runnerDocument.failed
+                                errors = [int]$runnerDocument.errors
+                            }
+                        } else {
+                            $testCounts = [ordered]@{
+                                total = [int]$runnerDocument.tests.total
+                                passed = [int]$runnerDocument.tests.passed
+                                skipped = [int]$runnerDocument.tests.skipped
+                                failures = [int]$runnerDocument.tests.failures
+                                errors = [int]$runnerDocument.tests.errors
+                            }
+                        }
+                    } catch {
+                        $runnerStatus = 'RESULT_PARSE_FAILED'
+                    }
+                }
+
+                $runnerResults.Add([ordered]@{
+                    runner = $spec.File
+                    status = $runnerStatus
+                    exit_code = [int]$runnerExit
+                    test_counts = $testCounts
+                })
+            }
+
+            $failedRunners = @($runnerResults | Where-Object { $_.exit_code -ne 0 })
+            $summary = [ordered]@{
+                schema = 'guardian6.windows_runner_pair.v1'
+                runner_results = @($runnerResults)
+                all_runners_passed = ($runnerResults.Count -eq 2 -and $failedRunners.Count -eq 0)
+                windows_client_gate = $true
+                runner_os_label = 'windows-2025'
+            }
+            $summary | ConvertTo-Json -Depth 8 |
+                Set-Content -LiteralPath (Join-Path $evidenceRoot 'runner-summary.json') -Encoding utf8
+
+            Copy-CandidateEvidenceSafely
+            if ($failedRunners.Count -eq 0 -and $runnerResults.Count -eq 2) {
+                $status = 'PASS_LANE_03_WINDOWS_CLIENT_VALIDATION'
+                $exitCode = 0
+            } else {
+                $status = 'FAIL_OR_PARTIAL_LANE_03_PLATFORM_VALIDATION'
+                $exitCode = 1
+            }
         }
     }
 }
