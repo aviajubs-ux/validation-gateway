@@ -1,0 +1,123 @@
+name: Controlled Validation
+run-name: "Validation lane ${{ inputs.lane }}"
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: Isolated execution lane
+        required: true
+        type: choice
+        options: ['01','02','03']
+permissions:
+  contents: read
+concurrency:
+  group: controlled-validation-${{ inputs.lane }}
+  cancel-in-progress: false
+jobs:
+  execute:
+    name: Isolated validation task
+    runs-on: windows-2025
+    timeout-minutes: 330
+    environment:
+      name: brain-validation
+    permissions:
+      contents: read
+    steps:
+      - name: Load runner harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Validate lane secrets are configured
+        id: preflight
+        shell: pwsh
+        env:
+          LANE_SOURCE_URL_01: ${{ inputs.lane == '01' && secrets.SOURCE_URL_01 || '' }}
+          LANE_SOURCE_SHA256_01: ${{ inputs.lane == '01' && secrets.SOURCE_SHA256_01 || '' }}
+          LANE_EVIDENCE_KEY_B64_01: ${{ inputs.lane == '01' && secrets.EVIDENCE_KEY_B64_01 || '' }}
+          LANE_SOURCE_URL_02: ${{ inputs.lane == '02' && secrets.SOURCE_URL_02 || '' }}
+          LANE_SOURCE_SHA256_02: ${{ inputs.lane == '02' && secrets.SOURCE_SHA256_02 || '' }}
+          LANE_EVIDENCE_KEY_B64_02: ${{ inputs.lane == '02' && secrets.EVIDENCE_KEY_B64_02 || '' }}
+          LANE_SOURCE_URL_03: ${{ inputs.lane == '03' && secrets.SOURCE_URL_03 || '' }}
+          LANE_SOURCE_SHA256_03: ${{ inputs.lane == '03' && secrets.SOURCE_SHA256_03 || '' }}
+          LANE_EVIDENCE_KEY_B64_03: ${{ inputs.lane == '03' && secrets.EVIDENCE_KEY_B64_03 || '' }}
+        run: |
+          $lane = '${{ inputs.lane }}'
+          $required = @("SOURCE_URL_$lane","SOURCE_SHA256_$lane","EVIDENCE_KEY_B64_$lane")
+          $missing = [System.Collections.Generic.List[string]]::new()
+          foreach ($name in $required) {
+            $value = [Environment]::GetEnvironmentVariable("LANE_" + $name)
+            if ([string]::IsNullOrWhiteSpace($value)) { $missing.Add($name) }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Output ('CONFIG_MISSING: ' + ($missing -join ', '))
+            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 1
+          }
+          "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Output 'LANE_CONFIGURATION_PRESENT'
+      - name: Execute isolated validation
+        id: execute
+        if: ${{ steps.preflight.outcome == 'success' }}
+        shell: pwsh
+        env:
+          SOURCE_URL_01: ${{ inputs.lane == '01' && secrets.SOURCE_URL_01 || '' }}
+          SOURCE_SHA256_01: ${{ inputs.lane == '01' && secrets.SOURCE_SHA256_01 || '' }}
+          EVIDENCE_KEY_B64_01: ${{ inputs.lane == '01' && secrets.EVIDENCE_KEY_B64_01 || '' }}
+          SOURCE_URL_02: ${{ inputs.lane == '02' && secrets.SOURCE_URL_02 || '' }}
+          SOURCE_SHA256_02: ${{ inputs.lane == '02' && secrets.SOURCE_SHA256_02 || '' }}
+          EVIDENCE_KEY_B64_02: ${{ inputs.lane == '02' && secrets.EVIDENCE_KEY_B64_02 || '' }}
+          SOURCE_URL_03: ${{ inputs.lane == '03' && secrets.SOURCE_URL_03 || '' }}
+          SOURCE_SHA256_03: ${{ inputs.lane == '03' && secrets.SOURCE_SHA256_03 || '' }}
+          EVIDENCE_KEY_B64_03: ${{ inputs.lane == '03' && secrets.EVIDENCE_KEY_B64_03 || '' }}
+        run: |
+          $lane = '${{ inputs.lane }}'
+          $env:SOURCE_URL = [Environment]::GetEnvironmentVariable("SOURCE_URL_$lane")
+          $env:SOURCE_SHA256 = [Environment]::GetEnvironmentVariable("SOURCE_SHA256_$lane")
+          $env:EVIDENCE_KEY_B64 = [Environment]::GetEnvironmentVariable("EVIDENCE_KEY_B64_$lane")
+          foreach ($suffix in '01','02','03') {
+            [Environment]::SetEnvironmentVariable("SOURCE_URL_$suffix",$null,'Process')
+            [Environment]::SetEnvironmentVariable("SOURCE_SHA256_$suffix",$null,'Process')
+            [Environment]::SetEnvironmentVariable("EVIDENCE_KEY_B64_$suffix",$null,'Process')
+          }
+          & "$env:GITHUB_WORKSPACE/.github/scripts/execute.ps1" -Lane $lane
+      - name: Seal evidence
+        id: seal
+        if: ${{ always() && steps.preflight.outcome == 'success' }}
+        shell: pwsh
+        env:
+          EVIDENCE_KEY_B64_01: ${{ inputs.lane == '01' && secrets.EVIDENCE_KEY_B64_01 || '' }}
+          EVIDENCE_KEY_B64_02: ${{ inputs.lane == '02' && secrets.EVIDENCE_KEY_B64_02 || '' }}
+          EVIDENCE_KEY_B64_03: ${{ inputs.lane == '03' && secrets.EVIDENCE_KEY_B64_03 || '' }}
+        run: |
+          $lane = '${{ inputs.lane }}'
+          $env:EVIDENCE_KEY_B64 = [Environment]::GetEnvironmentVariable("EVIDENCE_KEY_B64_$lane")
+          foreach ($suffix in '01','02','03') {
+            [Environment]::SetEnvironmentVariable("EVIDENCE_KEY_B64_$suffix",$null,'Process')
+          }
+          $sealScript = Join-Path $env:GITHUB_WORKSPACE '.github/scripts/seal.ps1'
+          $actualSealHash = (Get-FileHash -LiteralPath $sealScript -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSealHash -ne 'd46036edbfb8a3866336eb10d6289caf0bb4c7ff') {
+            throw 'TRUSTED_SEAL_SCRIPT_INTEGRITY_FAILURE'
+          }
+          & $sealScript
+      - name: Publish encrypted evidence only
+        if: ${{ always() && steps.seal.outputs.sealed == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: sealed-evidence-${{ inputs.lane }}
+          path: sealed/evidence.bin
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Report generic outcome
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          if ('${{ steps.preflight.outcome }}' -ne 'success') {
+            Write-Output 'CONFIGURATION_REQUIRED'
+          } elseif ('${{ steps.execute.outputs.status }}' -like 'PASS_*') {
+            Write-Output 'CONTROLLED_TASK_COMPLETED'
+          } else {
+            Write-Output 'CONTROLLED_TASK_REQUIRES_REVIEW'
+          }
