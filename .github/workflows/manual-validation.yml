@@ -77,7 +77,7 @@ jobs:
         id: executor
         shell: pwsh
         run: |
-          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=bd82e6b951b21aa5c8d134d159cd86c8f100eb32'
+          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=c66ecc54e592705fa723720825a361913d5443f9'
           $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
           if ($item.sha -ne 'f599900f93aec9e100e2fb75fc93df26101645bc' -or $item.encoding -ne 'base64') {
             throw 'TRUSTED_EXECUTOR_INTEGRITY_FAILURE'
@@ -115,7 +115,7 @@ jobs:
           $lane = '${{ inputs.lane }}'
           $env:EVIDENCE_KEY_B64 = $env:LANE_EVIDENCE_KEY_B64
           Remove-Item Env:LANE_EVIDENCE_KEY_B64 -ErrorAction SilentlyContinue
-          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/seal.ps1?ref=bd82e6b951b21aa5c8d134d159cd86c8f100eb32'
+          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/seal.ps1?ref=c66ecc54e592705fa723720825a361913d5443f9'
           $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
           if ($item.sha -ne 'd46036edbfb8a3866336eb10d6289caf0bb4c7ff' -or $item.encoding -ne 'base64') {
             throw 'TRUSTED_SEAL_SCRIPT_INTEGRITY_FAILURE'
