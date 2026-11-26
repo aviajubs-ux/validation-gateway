@@ -79,7 +79,7 @@ jobs:
         run: |
           $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=a7547ce7492b7425c26a3c282bea878359967d53'
           $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
-          if ($item.sha -ne '2788eae0d7c72399a44ea8724f8aca83fc49a1ab' -or $item.encoding -ne 'base64') {
+          if ($item.sha -ne 'aa2549525784da0dab93b4a5e064892a418d4311' -or $item.encoding -ne 'base64') {
             throw 'TRUSTED_EXECUTOR_INTEGRITY_FAILURE'
           }
           $encoded = ($item.content -replace '\s','')
@@ -89,6 +89,13 @@ jobs:
           [Array]::Clear($bytes,0,$bytes.Length)
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("path={0}" -f $scriptPath)
           Write-Output 'TRUSTED_EXECUTOR_LOADED'
+      - name: Run public process-capture self-tests
+        id: selftest
+        if: ${{ steps.executor.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $executorPath = '${{ steps.executor.outputs.path }}'
+          & $executorPath -SelfTest
       - name: Execute isolated validation
         id: execute
         if: ${{ steps.preflight.outcome == 'success' && steps.executor.outcome == 'success' }}
