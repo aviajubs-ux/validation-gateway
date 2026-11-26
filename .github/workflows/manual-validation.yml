@@ -25,7 +25,6 @@ jobs:
     steps:
       - name: Load pinned generic executor without repository credentials
         id: executor
-        if: ${{ steps.preflight.outcome == 'success' }}
         shell: pwsh
         run: |
           $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=bd82e6b951b21aa5c8d134d159cd86c8f100eb32'
