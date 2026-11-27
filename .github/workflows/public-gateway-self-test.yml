@@ -33,6 +33,7 @@ jobs:
 
           $checks = [System.Collections.Generic.List[object]]::new()
           $failed = [System.Collections.Generic.List[string]]::new()
+          $syntaxFindings = [System.Collections.Generic.List[string]]::new()
 
           function Add-Check {
             param([string]$Name, [bool]$Passed)
@@ -81,6 +82,9 @@ jobs:
               [System.Management.Automation.Language.Parser]::ParseFile(
                 $scriptItem.value.path, [ref]$tokens, [ref]$parseErrors
               ) | Out-Null
+              foreach ($parseError in $parseErrors) {
+                $syntaxFindings.Add(("{0}:{1}:{2}" -f $scriptItem.name, $parseError.Extent.StartLineNumber, $parseError.ErrorId))
+              }
               Add-Check -Name "$($scriptItem.name)_powershell_syntax" -Passed ($parseErrors.Count -eq 0)
             }
 
@@ -114,6 +118,7 @@ jobs:
             commit = $env:GITHUB_SHA
             runner = 'windows-2025'
             checks = @($checks)
+            syntax_findings = @($syntaxFindings)
             total = $checks.Count
             passed = $checks.Count - $failCount
             failed = $failCount
@@ -122,6 +127,7 @@ jobs:
           $reportPath = Join-Path $root 'public-policy-self-test.json'
           $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding utf8
           Write-Output ("PUBLIC_POLICY_SELF_TEST|{0}|{1}/{2}" -f $report.outcome, $report.passed, $report.total)
+          foreach ($finding in $syntaxFindings) { Write-Output ("POWERSHELL_PARSE_ERROR|" + $finding) }
           if ($failCount -gt 0) { exit 1 }
 
       - name: Upload public test report
