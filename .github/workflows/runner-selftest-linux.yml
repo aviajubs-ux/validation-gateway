@@ -58,6 +58,8 @@ jobs:
           fixture="$RUNNER_TEMP/linux-fixture"
           evidence="$RUNNER_TEMP/linux-selftest-evidence"
           mkdir -p "$evidence/positive"
+          sudo chown 65532:65532 "$evidence/positive"
+          sudo chmod 0700 "$evidence/positive"
 
           cid="$(docker create \
             --network none --read-only \
@@ -68,7 +70,7 @@ jobs:
             --tmpfs /build-on:rw,nosuid,nodev,size=3g,uid=65532,gid=65532,mode=1777 \
             --tmpfs /build-off:rw,nosuid,nodev,size=1g,uid=65532,gid=65532,mode=1777 \
             --tmpfs /build-san:rw,nosuid,nodev,size=3g,uid=65532,gid=65532,mode=1777 \
-            --tmpfs /evidence:rw,nosuid,nodev,size=256m,uid=65532,gid=65532,mode=1777 \
+            --mount "type=bind,src=$evidence/positive,dst=/evidence" \
             --mount "type=bind,src=$fixture,dst=/src,readonly" \
             --entrypoint /bin/bash "$image" -euc 'id; ls -ld /evidence /build-on /build-off /build-san /tmp; touch /evidence/write-probe.txt; exec bash -x /usr/local/bin/execute-linux-inner.sh /src')"
           docker inspect "$cid" --format 'memory={{.HostConfig.Memory}} nano_cpus={{.HostConfig.NanoCpus}} pids_limit={{.HostConfig.PidsLimit}} network={{.HostConfig.NetworkMode}} readonly={{.HostConfig.ReadonlyRootfs}}' | tee "$evidence/container-config.txt"
@@ -76,10 +78,6 @@ jobs:
           docker start --attach "$cid"
           result=$?
           set -e
-          if ! docker cp "$cid:/evidence/." "$evidence/positive/" >/dev/null 2>&1; then
-            echo "EVIDENCE_COPY_FAILED"
-            exit 1
-          fi
           echo "--- CONTAINER STATE ---"
           docker inspect "$cid" --format 'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' || true
           echo "--- CONTAINER LOGS ---"
@@ -120,6 +118,8 @@ jobs:
           fixture="$RUNNER_TEMP/linux-fixture"
           evidence="$RUNNER_TEMP/linux-selftest-evidence"
           mkdir -p "$evidence/negative"
+          sudo chown 65532:65532 "$evidence/negative"
+          sudo chmod 0700 "$evidence/negative"
           cid="$(docker create \
             --network none --read-only \
             --memory 6g --memory-swap 6g --cpus 2 --pids-limit 256 \
@@ -129,14 +129,13 @@ jobs:
             --tmpfs /build-on:rw,nosuid,nodev,size=3g,uid=65532,gid=65532,mode=1777 \
             --tmpfs /build-off:rw,nosuid,nodev,size=1g,uid=65532,gid=65532,mode=1777 \
             --tmpfs /build-san:rw,nosuid,nodev,size=3g,uid=65532,gid=65532,mode=1777 \
-            --tmpfs /evidence:rw,nosuid,nodev,size=256m,uid=65532,gid=65532,mode=1777 \
+            --mount "type=bind,src=$evidence/negative,dst=/evidence" \
             --mount "type=bind,src=$fixture,dst=/src,readonly" \
             "$image" /src)"
           set +e
           docker start --attach "$cid"
           result=$?
           set -e
-          docker cp "$cid:/evidence/." "$evidence/negative/" >/dev/null 2>&1
           docker rm "$cid" >/dev/null
           if [[ "$result" -eq 0 ]]; then
             echo "SELFTEST_FAILURE_SKIP_WAS_ACCEPTED"
