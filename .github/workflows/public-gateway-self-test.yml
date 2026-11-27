@@ -7,6 +7,7 @@ on:
       - ".github/workflows/public-gateway-self-test.yml"
       - ".github/workflows/manual-validation.yml"
       - ".github/scripts/execute.ps1"
+      - ".github/scripts/validation-dependencies.ps1"
       - ".github/scripts/seal.ps1"
   workflow_dispatch:
 
@@ -71,14 +72,19 @@ jobs:
           }
           $stage = 'fetch_executor'
           try {
-            $executor = Get-RepositoryScript '.github/scripts/execute.ps1' '9c09c4f9851394445c9b612c0a19d269bb45c9fe'
+            $executor = Get-RepositoryScript '.github/scripts/execute.ps1' 'e77b02c4387b24b2ee4a8b416757fd9c25812157'
             $stage = 'fetch_sealer'
             $sealer = Get-RepositoryScript '.github/scripts/seal.ps1' 'd46036edbfb8a3866336eb10d6289caf0bb4c7ff'
+            $stage = 'fetch_dependency_bootstrap'
+            $dependencyBootstrap = Get-RepositoryScript '.github/scripts/validation-dependencies.ps1' '5d4b21317ed426a30e2e981e78f1b8fe7ef822ea'
+
+            $stage = 'parse_scripts'
 
             $stage = 'parse_scripts'
             foreach ($scriptItem in @(
               @{ name = 'executor'; value = $executor },
-              @{ name = 'sealer'; value = $sealer }
+              @{ name = 'sealer'; value = $sealer },
+              @{ name = 'dependency_bootstrap'; value = $dependencyBootstrap }
             )) {
               $tokens = $null
               $parseErrors = $null
@@ -105,6 +111,12 @@ jobs:
             Add-Check -Name 'candidate_environment_allowlisted' -Passed ($e.Contains('$safeEnvironment = @(') -and $e.Contains('$psi.Environment.Clear()'))
             Add-Check -Name 'candidate_runs_as_temporary_user' -Passed ($e.Contains('$psi.UserName = $script:candidateUserName'))
 
+            $d = $dependencyBootstrap.text
+            Add-Check -Name 'dependency_bootstrap_host_allowlist' -Passed ($d.Contains("files.pythonhosted.org"))
+            Add-Check -Name 'dependency_bootstrap_hash_verification' -Passed ($d.Contains('VALIDATION_DEPENDENCY_HASH_MISMATCH'))
+            Add-Check -Name 'dependency_bootstrap_offline_pip' -Passed ($d.Contains('--no-index') -and $d.Contains('--require-hashes'))
+            Add-Check -Name 'dependency_bootstrap_cpython_arch_check' -Passed ($d.Contains("platform.machine().lower()"))
+            
             $s = $sealer.text
             Add-Check -Name 'evidence_aes_gcm_encryption' -Passed ($s.Contains('[Security.Cryptography.AesGcm]'))
             Add-Check -Name 'evidence_encrypt_decrypt_self_check' -Passed ($s.Contains('$aes.Encrypt(') -and $s.Contains('$aes.Decrypt('))
