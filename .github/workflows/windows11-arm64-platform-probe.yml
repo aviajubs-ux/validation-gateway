@@ -53,13 +53,13 @@ jobs:
               [DllImport("advapi32.dll", SetLastError = true)]
               public static extern IntPtr FreeSid(IntPtr sid);
 
-              [UnmanagedFunctionPointer(CallingConvention.Winapi, CharSet = CharSet.Unicode)]
-              public delegate int CreateAppContainerProfileDelegate(
+              [DllImport("userenv.dll", CharSet = CharSet.Unicode, ExactSpelling = true, PreserveSig = true)]
+              public static extern int CreateAppContainerProfile(
                   string name, string displayName, string description,
                   IntPtr capabilities, uint capabilityCount, out IntPtr sid);
 
-              [UnmanagedFunctionPointer(CallingConvention.Winapi, CharSet = CharSet.Unicode)]
-              public delegate int DeleteAppContainerProfileDelegate(string name);
+              [DllImport("userenv.dll", CharSet = CharSet.Unicode, ExactSpelling = true, PreserveSig = true)]
+              public static extern int DeleteAppContainerProfile(string name);
           }
           '@
 
@@ -67,30 +67,18 @@ jobs:
           if ($job -eq [IntPtr]::Zero) { throw 'JOB_OBJECT_CREATE_FAILED' }
           if (-not [TeliPlatformProbeNative]::CloseHandle($job)) { throw 'JOB_OBJECT_CLOSE_FAILED' }
 
-          $userenv = [TeliPlatformProbeNative]::LoadLibraryW('userenv.dll')
-          if ($userenv -eq [IntPtr]::Zero) { throw 'USERENV_LOAD_FAILED' }
-          $createPtr = [TeliPlatformProbeNative]::GetProcAddress($userenv, 'CreateAppContainerProfile')
-          $deletePtr = [TeliPlatformProbeNative]::GetProcAddress($userenv, 'DeleteAppContainerProfile')
-          if ($createPtr -eq [IntPtr]::Zero -or $deletePtr -eq [IntPtr]::Zero) {
-            throw 'APPCONTAINER_EXPORTS_UNAVAILABLE'
-          }
-
-          $create = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
-            $createPtr, [type][TeliPlatformProbeNative+CreateAppContainerProfileDelegate])
-          $delete = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
-            $deletePtr, [type][TeliPlatformProbeNative+DeleteAppContainerProfileDelegate])
-
           $profileName = 'TELI-PLATFORM-PROBE-' + [Guid]::NewGuid().ToString('N')
           $sid = [IntPtr]::Zero
-          $hr = $create.Invoke($profileName, 'TELI platform probe', 'Temporary capability probe', [IntPtr]::Zero, 0, [ref]$sid)
+          $hr = [TeliPlatformProbeNative]::CreateAppContainerProfile(
+            $profileName, 'TELI platform probe', 'Temporary capability probe',
+            [IntPtr]::Zero, 0, [ref]$sid)
           if ($hr -ne 0 -or $sid -eq [IntPtr]::Zero) { throw 'APPCONTAINER_PROFILE_CREATE_FAILED' }
 
           try {
-            $deleteHr = $delete.Invoke($profileName)
+            $deleteHr = [TeliPlatformProbeNative]::DeleteAppContainerProfile($profileName)
             if ($deleteHr -ne 0) { throw 'APPCONTAINER_PROFILE_DELETE_FAILED' }
           } finally {
             if ($sid -ne [IntPtr]::Zero) { [void][TeliPlatformProbeNative]::FreeSid($sid) }
-            [void][TeliPlatformProbeNative]::CloseHandle($userenv)
           }
 
           $pipeName = 'teli-platform-probe-' + [Guid]::NewGuid().ToString('N')
