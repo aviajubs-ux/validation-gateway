@@ -70,7 +70,7 @@ jobs:
             --tmpfs /build-san:rw,nosuid,nodev,size=3g,uid=65532,gid=65532,mode=1777 \
             --tmpfs /evidence:rw,nosuid,nodev,size=256m,uid=65532,gid=65532,mode=1777 \
             --mount "type=bind,src=$fixture,dst=/src,readonly" \
-            "$image" /src)"
+            --entrypoint /bin/bash "$image" -euc 'id; ls -ld /evidence /build-on /build-off /build-san /tmp; touch /evidence/write-probe.txt; exec bash -x /usr/local/bin/execute-linux-inner.sh /src')"
           docker inspect "$cid" --format 'memory={{.HostConfig.Memory}} nano_cpus={{.HostConfig.NanoCpus}} pids_limit={{.HostConfig.PidsLimit}} network={{.HostConfig.NetworkMode}} readonly={{.HostConfig.ReadonlyRootfs}}' | tee "$evidence/container-config.txt"
           set +e
           docker start --attach "$cid"
@@ -80,8 +80,12 @@ jobs:
             echo "EVIDENCE_COPY_FAILED"
             exit 1
           fi
-          docker rm "$cid" >/dev/null
+          echo "--- CONTAINER STATE ---"
+          docker inspect "$cid" --format 'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' || true
+          echo "--- CONTAINER LOGS ---"
+          docker logs "$cid" 2>&1 | tail -n 240 || true
           echo "LINUX_FIXTURE_EXIT_CODE=$result"
+          docker rm "$cid" >/dev/null
           if [[ -f "$evidence/positive/stages.env" ]]; then
             echo "--- STAGES ---"
             cat "$evidence/positive/stages.env"
