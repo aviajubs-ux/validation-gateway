@@ -1,12 +1,68 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory=$false)]
     [ValidateSet('01','02','03')]
-    [string]$Lane
+    [string]$Lane,
+    [switch]$SelfTest
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+function Get-ValidationEntrypoint {
+    param([Parameter(Mandatory=$true)][string]$PayloadRoot)
+
+    $excludedSegments = @('legacy_reference','archive','archives','backup','backups','obsolete','superseded','reference')
+    $allMatches = @(Get-ChildItem -LiteralPath $PayloadRoot -Filter 'run_*_integration_windows.py' -File -Recurse)
+    $activeMatches = @()
+    foreach ($match in $allMatches) {
+        $relative = [IO.Path]::GetRelativePath($PayloadRoot,$match.FullName)
+        $segments = $relative -split '[\\/]'
+        $isHistorical = @($segments | Where-Object { $excludedSegments -contains $_ }).Count -gt 0
+        if ($isHistorical) { continue }
+        $candidateRoot = $match.Directory.Parent.FullName
+        if (Test-Path -LiteralPath (Join-Path $candidateRoot 'source/active') -PathType Container) {
+            $activeMatches += [pscustomobject]@{ Runner=$match.FullName; ProjectRoot=$candidateRoot }
+        }
+    }
+    if ($activeMatches.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
+    return $activeMatches[0]
+}
+
+if ($SelfTest) {
+    $fixture = Join-Path ([IO.Path]::GetTempPath()) ('validation-entrypoint-selftest-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $active = Join-Path $fixture 'candidate'
+        $verification = Join-Path $active 'verification'
+        $legacy = Join-Path $verification 'legacy_reference'
+        New-Item -ItemType Directory -Path (Join-Path $active 'source/active'),$verification,$legacy -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $verification 'run_active_integration_windows.py') -Value '# active fixture' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $legacy 'run_old_integration_windows.py') -Value '# legacy fixture' -Encoding utf8
+        $resolved = Get-ValidationEntrypoint -PayloadRoot $fixture
+        if ([IO.Path]::GetFileName($resolved.Runner) -ne 'run_active_integration_windows.py') {
+            throw 'SELFTEST_ACTIVE_ENTRYPOINT_NOT_SELECTED'
+        }
+        if ($resolved.ProjectRoot -ne $active) { throw 'SELFTEST_PROJECT_ROOT_MISMATCH' }
+
+        $second = Join-Path $active 'verification_alt'
+        New-Item -ItemType Directory -Path $second -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $second 'run_second_integration_windows.py') -Value '# duplicate fixture' -Encoding utf8
+        $duplicateRejected = $false
+        try { Get-ValidationEntrypoint -PayloadRoot $fixture | Out-Null }
+        catch { $duplicateRejected = ([string]$_.Exception.Message -eq 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID') }
+        if (-not $duplicateRejected) { throw 'SELFTEST_AMBIGUOUS_ENTRYPOINT_NOT_REJECTED' }
+
+        Write-Output 'SELFTEST_PASS_ENTRYPOINT_LEGACY_EXCLUSION'
+        Write-Output 'SELFTEST_PASS_ENTRYPOINT_AMBIGUITY_REJECTION'
+        Write-Output 'VALIDATION_GATEWAY_SELFTEST_PASS'
+        exit 0
+    }
+    finally {
+        Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($Lane)) { throw 'VALIDATION_LANE_REQUIRED' }
 $startedUtc = [DateTime]::UtcNow.ToString('o')
 
 $runRoot = Join-Path $env:RUNNER_TEMP 'validation'
@@ -378,11 +434,9 @@ try {
         # Generic Windows-client package contract: exactly one runner under the package
         # must match run_*_integration_windows.py. No product-specific names are embedded
         # in this public execution infrastructure.
-        $runnerCandidates = @(Get-ChildItem -LiteralPath $payloadRoot -Filter 'run_*_integration_windows.py' -File -Recurse)
-        if ($runnerCandidates.Count -ne 1) { throw 'PACKAGE_ENTRYPOINT_LAYOUT_INVALID' }
-
-        $runner = $runnerCandidates[0].FullName
-        $projectRoot = $runnerCandidates[0].Directory.Parent.FullName
+        $entrypoint = Get-ValidationEntrypoint -PayloadRoot $payloadRoot
+        $runner = $entrypoint.Runner
+        $projectRoot = $entrypoint.ProjectRoot
         $requiredSourceRoot = Join-Path $projectRoot 'source/active'
         if (!(Test-Path -LiteralPath $requiredSourceRoot -PathType Container)) {
             throw 'PACKAGE_SOURCE_LAYOUT_INVALID'
