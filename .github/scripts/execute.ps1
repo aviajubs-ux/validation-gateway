@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory=$false)]
     [ValidateSet('01','02','03')]
     [string]$Lane,
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    [string]$DependencyBootstrapPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -71,6 +72,10 @@ $evidenceRoot = Join-Path $runRoot 'evidence'
 $buildRoot = Join-Path $runRoot 'build'
 $candidateOutputRoot = Join-Path $runRoot 'candidate-output'
 $archivePath = Join-Path $runRoot 'source.zip'
+$script:pythonDependencyRoot = $null
+$script:validationPythonExecutable = $null
+$script:validationPythonPrefixArgs = @()
+$script:validationPythonVersion = $null
 
 # Read bootstrap inputs once. Never pass these values to any candidate process.
 $sourceUrl = $env:SOURCE_URL
@@ -200,6 +205,18 @@ function Initialize-CandidateSandbox {
     & $icacls $payloadRoot /grant $sidAceRead /T /C /Q | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_PAYLOAD_READONLY_GRANT_FAILED' }
 
+    if ($script:pythonDependencyRoot) {
+        if (-not (Test-Path -LiteralPath $script:pythonDependencyRoot -PathType Container)) {
+            throw 'VALIDATION_DEPENDENCY_DIRECTORY_MISSING'
+        }
+        $dependencyDenyAce = "*$($script:candidateSid):(OI)(CI)M"
+        $dependencyReadAce = "*$($script:candidateSid):(OI)(CI)RX"
+        & $icacls $script:pythonDependencyRoot /deny $dependencyDenyAce /T /C /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'VALIDATION_DEPENDENCY_READONLY_ACL_FAILED' }
+        & $icacls $script:pythonDependencyRoot /grant $dependencyReadAce /T /C /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'VALIDATION_DEPENDENCY_READ_ACL_FAILED' }
+    }
+
     foreach ($writablePath in @($buildRoot,$candidateOutputRoot,$script:candidateTemp)) {
         New-Item -ItemType Directory -Path $writablePath -Force | Out-Null
         & $icacls $writablePath /grant $sidAceModify /T /C /Q | Out-Null
@@ -291,6 +308,7 @@ function Invoke-Captured {
     $psi.Environment['TMP'] = $script:candidateTemp
     $psi.Environment['APPDATA'] = Join-Path $profileHome 'AppData/Roaming'
     $psi.Environment['LOCALAPPDATA'] = Join-Path $profileHome 'AppData/Local'
+    if ($script:pythonDependencyRoot) { $psi.Environment['VALIDATION_PYTHON_DEPENDENCIES'] = $script:pythonDependencyRoot }
     $psi.Environment['PSModulePath'] = @(
         (Join-Path $env:ProgramFiles 'PowerShell/Modules'),
         (Join-Path $env:ProgramFiles 'WindowsPowerShell/Modules'),
@@ -352,6 +370,20 @@ try {
     $expectedHash = $null
 
     Expand-Archive -LiteralPath $archivePath -DestinationPath $payloadRoot -Force
+
+    # Bootstrap locked dependencies only for a genuine Windows client validation run.
+    if ($Lane -eq '03' -and [int]$os.ProductType -eq 1 -and [int]$os.BuildNumber -ge 22000) {
+        if ([string]::IsNullOrWhiteSpace($DependencyBootstrapPath) -or
+            -not (Test-Path -LiteralPath $DependencyBootstrapPath -PathType Leaf)) {
+            throw 'VALIDATION_DEPENDENCY_BOOTSTRAP_MISSING'
+        }
+        . $DependencyBootstrapPath
+        $dependencyResult = Initialize-ValidationDependencyWheelhouse -CandidateRoot $payloadRoot -RunRoot $runRoot
+        $script:pythonDependencyRoot = $dependencyResult.DependencyRoot
+        $script:validationPythonExecutable = $dependencyResult.PythonExecutable
+        $script:validationPythonPrefixArgs = @($dependencyResult.PythonPrefixArgs)
+        $script:validationPythonVersion = $dependencyResult.PythonVersion
+    }
 
     # Candidate code runs as a temporary standard user with user-scoped inbound
     # and outbound network blocks. No checkout token or GitHub credential is used.
@@ -458,13 +490,15 @@ try {
                 Set-Content -LiteralPath (Join-Path $evidenceRoot 'platform-limit.json') -Encoding utf8
         }
         else {
-            $python = (Get-Command python.exe -ErrorAction Stop).Source
+            if (-not $script:validationPythonExecutable) { throw 'VALIDATION_PYTHON_NOT_SELECTED' }
+            $python = $script:validationPythonExecutable
             $runnerOutput = Join-Path $candidateOutputRoot 'windows-client'
             New-Item -ItemType Directory -Path $runnerOutput -Force | Out-Null
             $runnerLog = Join-Path $evidenceRoot 'windows-client-launch.log'
-            $runnerExit = Invoke-Captured -Executable $python -Arguments @(
+            $runnerArguments = @($script:validationPythonPrefixArgs) + @(
                 $runner,'--project-root',$projectRoot,'--output-dir',$runnerOutput
-            ) -LogPath $runnerLog -WorkingDirectory $projectRoot
+            )
+            $runnerExit = Invoke-Captured -Executable $python -Arguments $runnerArguments -LogPath $runnerLog -WorkingDirectory $projectRoot
 
             $runnerStatus = 'RESULT_UNAVAILABLE'
             $testCounts = $null
@@ -493,6 +527,7 @@ try {
                 runner_status = $runnerStatus
                 runner_exit_code = [int]$runnerExit
                 test_counts = $testCounts
+                validation_python_version = $script:validationPythonVersion
                 windows_client_gate = $true
                 runner_os_label = 'windows-2025'
             }
