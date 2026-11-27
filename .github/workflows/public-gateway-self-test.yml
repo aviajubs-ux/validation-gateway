@@ -70,7 +70,7 @@ jobs:
             }
           }
           try {
-            $executor = Get-RepositoryScript '.github/scripts/execute.ps1' '4b6dc63408980e400acb94458e6d675a4f065444'
+            $executor = Get-RepositoryScript '.github/scripts/execute.ps1' '9c09c4f9851394445c9b612c0a19d269bb45c9fe'
             $sealer = Get-RepositoryScript '.github/scripts/seal.ps1' 'd46036edbfb8a3866336eb10d6289caf0bb4c7ff'
 
             foreach ($scriptItem in @(
@@ -95,6 +95,8 @@ jobs:
             Add-Check -Name 'evidence_path_containment' -Passed ($e.Contains('$full.StartsWith($root'))
             Add-Check -Name 'evidence_reparse_points_rejected' -Passed ($e.Contains('CANDIDATE_EVIDENCE_REPARSE_POINT_REJECTED'))
             Add-Check -Name 'candidate_write_acl_is_scoped' -Passed ($e.Contains('@($buildRoot,$candidateOutputRoot,$script:candidateTemp)'))
+            Add-Check -Name 'candidate_payload_is_read_only' -Passed ($e.Contains('$icacls $payloadRoot /deny $sidAceModify'))
+            Add-Check -Name 'candidate_payload_read_is_allowed' -Passed ($e.Contains('$icacls $payloadRoot /grant $sidAceRead'))
             Add-Check -Name 'candidate_network_egress_blocked' -Passed ($e.Contains('-Direction Outbound -Action Block'))
             Add-Check -Name 'candidate_secret_environment_cleared' -Passed ($e.Contains('Remove-Item -LiteralPath ("Env:" + $name)'))
             Add-Check -Name 'candidate_environment_allowlisted' -Passed ($e.Contains('$safeEnvironment = @(') -and $e.Contains('$psi.Environment.Clear()'))
