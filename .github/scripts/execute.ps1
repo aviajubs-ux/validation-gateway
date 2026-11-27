@@ -16,6 +16,8 @@ $buildRoot = Join-Path $runRoot 'build'
 $candidateOutputRoot = Join-Path $runRoot 'candidate-output'
 $archivePath = Join-Path $runRoot 'source.zip'
 $script:pythonDependencyRoot = $null
+$script:validationPythonExecutable = $null
+$script:validationPythonPrefixArgs = @()
 
 # Read bootstrap inputs once. Never pass these values to any candidate process.
 $sourceUrl = $env:SOURCE_URL
@@ -432,13 +434,13 @@ try {
                 Set-Content -LiteralPath (Join-Path $evidenceRoot 'platform-limit.json') -Encoding utf8
         }
         else {
-            $python = (Get-Command python.exe -ErrorAction Stop).Source
+            if (-not $script:validationPythonExecutable) { throw 'VALIDATION_PYTHON_NOT_SELECTED' }
+            $python = $script:validationPythonExecutable
             $runnerOutput = Join-Path $candidateOutputRoot 'windows-client'
             New-Item -ItemType Directory -Path $runnerOutput -Force | Out-Null
             $runnerLog = Join-Path $evidenceRoot 'windows-client-launch.log'
-            $runnerExit = Invoke-Captured -Executable $python -Arguments @(
-                $runner,'--project-root',$projectRoot,'--output-dir',$runnerOutput
-            ) -LogPath $runnerLog -WorkingDirectory $projectRoot
+            $runnerArgs = @($script:validationPythonPrefixArgs) + @($runner,'--project-root',$projectRoot,'--output-dir',$runnerOutput)
+            $runnerExit = Invoke-Captured -Executable $python -Arguments $runnerArgs -LogPath $runnerLog -WorkingDirectory $projectRoot
 
             $runnerStatus = 'RESULT_UNAVAILABLE'
             $testCounts = $null
@@ -1889,8 +1891,35 @@ exit 0
             if ($actualSha -ne $artifact.sha256) { throw 'VALIDATION_DEPENDENCY_HASH_MISMATCH' }
         }
 
-        $python = (Get-Command python.exe -ErrorAction Stop).Source
-        & $python -m pip install --disable-pip-version-check --no-index --find-links $wheelhouse --require-hashes --only-binary=:all: --no-compile --target $script:pythonDependencyRoot -r $lockPath 1>$null 2>$null
+        # Pin the validation interpreter to CPython 3.13 (preferred) or 3.12
+        # so the locked cffi wheel tag is deterministic on the hosted image.
+        $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
+        $selected = $false
+        if ($launcher) {
+            foreach ($minor in @('3.13','3.12')) {
+                & $launcher.Source ("-" + $minor) -c "import sys; raise SystemExit(0 if sys.implementation.name == 'cpython' and sys.version_info[:2] == tuple(map(int, '$minor'.split('.'))) and sys.maxsize > 2**32 else 1)" 1>$null 2>$null
+                if ($LASTEXITCODE -eq 0) {
+                    $script:validationPythonExecutable = $launcher.Source
+                    $script:validationPythonPrefixArgs = @("-" + $minor)
+                    $selected = $true
+                    break
+                }
+            }
+        }
+        if (-not $selected) {
+            $python = Get-Command python.exe -ErrorAction SilentlyContinue
+            if ($python) {
+                & $python.Source -c "import sys; raise SystemExit(0 if sys.implementation.name == 'cpython' and sys.version_info[:2] in ((3,12),(3,13)) and sys.maxsize > 2**32 else 1)" 1>$null 2>$null
+                if ($LASTEXITCODE -eq 0) {
+                    $script:validationPythonExecutable = $python.Source
+                    $script:validationPythonPrefixArgs = @()
+                    $selected = $true
+                }
+            }
+        }
+        if (-not $selected) { throw 'VALIDATION_CPYTHON_312_OR_313_X64_REQUIRED' }
+        $pipArgs = @($script:validationPythonPrefixArgs) + @('-m','pip','install','--disable-pip-version-check','--no-index','--find-links',$wheelhouse,'--require-hashes','--only-binary=:all:','--no-compile','--target',$script:pythonDependencyRoot,'-r',$lockPath)
+        & $script:validationPythonExecutable @pipArgs 1>$null 2>$null
         if ($LASTEXITCODE -ne 0) { throw 'VALIDATION_DEPENDENCY_INSTALL_FAILED' }
     } catch {
         $script:pythonDependencyRoot = $null
