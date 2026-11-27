@@ -69,10 +69,13 @@ jobs:
               sha = $actualSha
             }
           }
+          $stage = 'fetch_executor'
           try {
             $executor = Get-RepositoryScript '.github/scripts/execute.ps1' '9c09c4f9851394445c9b612c0a19d269bb45c9fe'
+            $stage = 'fetch_sealer'
             $sealer = Get-RepositoryScript '.github/scripts/seal.ps1' 'd46036edbfb8a3866336eb10d6289caf0bb4c7ff'
 
+            $stage = 'parse_scripts'
             foreach ($scriptItem in @(
               @{ name = 'executor'; value = $executor },
               @{ name = 'sealer'; value = $sealer }
@@ -109,9 +112,12 @@ jobs:
             Add-Check -Name 'plaintext_archive_removed' -Passed ($s.Contains('Remove-Item -LiteralPath $plainArchive'))
           }
           catch {
+            $failureMessage = [string]$_.Exception.Message
+            $failureMessage = $failureMessage -replace 'https?://[^\s]+', 'URL_REDACTED'
+            $failureMessage = $failureMessage -replace '[A-Za-z]:\\[^\s]+', 'PATH_REDACTED'
             $failed.Add('SCRIPT_FETCH_OR_VALIDATION_ERROR')
             $checks.Add([ordered]@{ name = 'script_fetch_and_validation'; status = 'FAIL' })
-            Write-Output ('PUBLIC_SCRIPT_VALIDATION_ERROR|' + $_.Exception.GetType().Name)
+            Write-Output ('PUBLIC_SCRIPT_VALIDATION_ERROR|' + $stage + '|' + $_.Exception.GetType().Name + '|' + $failureMessage)
           }
 
           $failCount = @($checks | Where-Object { $_.status -eq 'FAIL' }).Count
