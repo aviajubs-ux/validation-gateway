@@ -81,6 +81,16 @@ jobs:
             exit 1
           fi
           docker rm "$cid" >/dev/null
+          echo "LINUX_FIXTURE_EXIT_CODE=$result"
+          if [[ -f "$evidence/positive/stages.env" ]]; then
+            echo "--- STAGES ---"
+            cat "$evidence/positive/stages.env"
+          fi
+          for f in "$evidence"/positive/*.log "$evidence"/positive/*.txt; do
+            [[ -f "$f" ]] || continue
+            echo "--- LOG: $(basename "$f") ---"
+            tail -n 160 "$f"
+          done
           if [[ "$result" -ne 0 ]]; then
             echo "LINUX_FIXTURE_VALIDATION_FAILED"
             exit 1
@@ -151,6 +161,15 @@ jobs:
               python3 -c "import socket; s=socket.socket(); s.settimeout(1); rc=s.connect_ex(('1.1.1.1',443)); s.close(); assert rc != 0"
               echo "NETWORK_BLOCKED READONLY_ROOT STANDARD_USER PASS"
             '
+      - name: Preserve Linux runner self-test evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: linux-runner-selftest-evidence
+          path: ${{ runner.temp }}/linux-selftest-evidence
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 6
       - name: Clean up images and temporary directories
         if: always()
         shell: bash
