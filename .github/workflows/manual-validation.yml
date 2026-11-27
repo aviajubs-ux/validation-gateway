@@ -77,9 +77,9 @@ jobs:
         id: executor
         shell: pwsh
         run: |
-          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=5e18a6f6a53984daefac30c10114e9ca5b84421a'
+          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=83804d039a81c7e38dbf872832acd47f09bd1ae7'
           $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
-          if ($item.sha -ne '9c09c4f9851394445c9b612c0a19d269bb45c9fe' -or $item.encoding -ne 'base64') {
+          if ($item.sha -ne 'e77b02c4387b24b2ee4a8b416757fd9c25812157' -or $item.encoding -ne 'base64') {
             throw 'TRUSTED_EXECUTOR_INTEGRITY_FAILURE'
           }
           $encoded = ($item.content -replace '\s','')
@@ -88,7 +88,18 @@ jobs:
           [IO.File]::WriteAllBytes($scriptPath,$bytes)
           [Array]::Clear($bytes,0,$bytes.Length)
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("path={0}" -f $scriptPath)
-          Write-Output 'TRUSTED_EXECUTOR_LOADED'
+
+          $dependencyUri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/validation-dependencies.ps1?ref=83804d039a81c7e38dbf872832acd47f09bd1ae7'
+          $dependencyItem = Invoke-RestMethod -Uri $dependencyUri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
+          if ($dependencyItem.sha -ne '5d4b21317ed426a30e2e981e78f1b8fe7ef822ea' -or $dependencyItem.encoding -ne 'base64') {
+            throw 'TRUSTED_DEPENDENCY_BOOTSTRAP_INTEGRITY_FAILURE'
+          }
+          $dependencyBytes = [Convert]::FromBase64String(($dependencyItem.content -replace '\s',''))
+          $dependencyScript = Join-Path $env:RUNNER_TEMP 'validation-dependencies.ps1'
+          [IO.File]::WriteAllBytes($dependencyScript,$dependencyBytes)
+          [Array]::Clear($dependencyBytes,0,$dependencyBytes.Length)
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("dependency_path={0}" -f $dependencyScript)
+          Write-Output 'TRUSTED_EXECUTOR_AND_DEPENDENCY_BOOTSTRAP_LOADED'
       - name: Execute isolated validation
         id: execute
         if: ${{ steps.preflight.outcome == 'success' && steps.executor.outcome == 'success' }}
@@ -104,7 +115,8 @@ jobs:
           $env:EVIDENCE_KEY_B64 = $env:LANE_EVIDENCE_KEY_B64
           Remove-Item Env:LANE_SOURCE_URL,Env:LANE_SOURCE_SHA256,Env:LANE_EVIDENCE_KEY_B64 -ErrorAction SilentlyContinue
           $executorPath = '${{ steps.executor.outputs.path }}'
-          & $executorPath -Lane $lane
+          $dependencyPath = '${{ steps.executor.outputs.dependency_path }}'
+          & $executorPath -Lane $lane -DependencyBootstrapPath $dependencyPath
       - name: Seal evidence
         id: seal
         if: ${{ always() && steps.preflight.outcome == 'success' && steps.executor.outcome == 'success' }}
