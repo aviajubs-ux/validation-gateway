@@ -42,19 +42,12 @@ jobs:
           }
 
           function Get-RepositoryScript {
-            param([string]$Path)
-            $encodedPath = [Uri]::EscapeUriString($Path)
-            $uri = "https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/$encodedPath?ref=$env:GITHUB_SHA"
-            $item = Invoke-RestMethod -Uri $uri -Headers @{
-              Accept = 'application/vnd.github+json'
-              'X-GitHub-Api-Version' = '2022-11-28'
-            } -ErrorAction Stop
+            param([string]$Path, [string]$ExpectedBlobSha)
+            $localPath = Join-Path $root ([IO.Path]::GetFileName($Path))
+            $uri = "https://raw.githubusercontent.com/aviajubs-ux/validation-gateway/$env:GITHUB_SHA/$Path"
+            Invoke-WebRequest -Uri $uri -OutFile $localPath -MaximumRedirection 3 -ErrorAction Stop
 
-            if ($item.encoding -ne 'base64' -or [string]::IsNullOrWhiteSpace($item.sha)) {
-              throw 'REPOSITORY_SCRIPT_METADATA_INVALID'
-            }
-
-            $bytes = [Convert]::FromBase64String(($item.content -replace '\s',''))
+            $bytes = [IO.File]::ReadAllBytes($localPath)
             $header = [Text.Encoding]::UTF8.GetBytes("blob $($bytes.Length)`0")
             $blob = [byte[]]::new($header.Length + $bytes.Length)
             [Buffer]::BlockCopy($header, 0, $blob, 0, $header.Length)
@@ -64,25 +57,20 @@ jobs:
             $actualSha = [Convert]::ToHexString($digest).ToLowerInvariant()
             [Array]::Clear($blob, 0, $blob.Length)
             [Array]::Clear($digest, 0, $digest.Length)
+            [Array]::Clear($bytes, 0, $bytes.Length)
 
-            if ($actualSha -ne $item.sha.ToLowerInvariant()) {
-              [Array]::Clear($bytes, 0, $bytes.Length)
+            if ($actualSha -ne $ExpectedBlobSha) {
               throw 'REPOSITORY_SCRIPT_BLOB_SHA_MISMATCH'
             }
-
-            $localPath = Join-Path $root ([IO.Path]::GetFileName($Path))
-            [IO.File]::WriteAllBytes($localPath, $bytes)
-            [Array]::Clear($bytes, 0, $bytes.Length)
             return [ordered]@{
               path = $localPath
               text = [IO.File]::ReadAllText($localPath, [Text.UTF8Encoding]::new($false))
               sha = $actualSha
             }
           }
-
           try {
-            $executor = Get-RepositoryScript '.github/scripts/execute.ps1'
-            $sealer = Get-RepositoryScript '.github/scripts/seal.ps1'
+            $executor = Get-RepositoryScript '.github/scripts/execute.ps1' '4b6dc63408980e400acb94458e6d675a4f065444'
+            $sealer = Get-RepositoryScript '.github/scripts/seal.ps1' 'd46036edbfb8a3866336eb10d6289caf0bb4c7ff'
 
             foreach ($scriptItem in @(
               @{ name = 'executor'; value = $executor },
@@ -117,7 +105,7 @@ jobs:
           catch {
             $failed.Add('SCRIPT_FETCH_OR_VALIDATION_ERROR')
             $checks.Add([ordered]@{ name = 'script_fetch_and_validation'; status = 'FAIL' })
-            Write-Output 'PUBLIC_SCRIPT_VALIDATION_ERROR'
+            Write-Output ('PUBLIC_SCRIPT_VALIDATION_ERROR|' + $_.Exception.GetType().Name)
           }
 
           $failCount = @($checks | Where-Object { $_.status -eq 'FAIL' }).Count
