@@ -78,10 +78,33 @@ jobs:
           docker start --attach "$cid"
           result=$?
           set -e
+
+          # Always save Docker diagnostics before the evidence-copy attempt.
+          docker logs "$cid" > "$evidence/container-runtime.log" 2>&1 || true
+          docker inspect "$cid" --format 'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}} oom_killed={{.State.OOMKilled}} started={{.State.StartedAt}} finished={{.State.FinishedAt}}' > "$evidence/container-state.txt" 2>&1 || true
+          docker inspect "$cid" --format '{{json .Mounts}}' > "$evidence/container-mounts.json" 2>&1 || true
+
+          set +e
+          docker cp "$cid:/evidence/." "$evidence/positive/" > "$evidence/docker-cp.log" 2>&1
+          copy_result=$?
+          set -e
+          if [[ "$copy_result" -ne 0 ]]; then
+            echo "EVIDENCE_COPY_FAILED|exit=$copy_result"
+            echo "--- DOCKER COPY ERROR ---"
+            cat "$evidence/docker-cp.log" || true
+            echo "--- CONTAINER STATE ---"
+            cat "$evidence/container-state.txt" || true
+            echo "--- CONTAINER RUNTIME LOG ---"
+            tail -n 240 "$evidence/container-runtime.log" || true
+          fi
+
           echo "--- CONTAINER STATE ---"
-          docker inspect "$cid" --format 'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' || true
-          echo "--- CONTAINER LOGS ---"
-          docker logs "$cid" 2>&1 | tail -n 240 || true
+          cat "$evidence/container-state.txt" || true
+          echo "--- CONTAINER RUNTIME LOG ---"
+          tail -n 240 "$evidence/container-runtime.log" || true
+
+          docker rm "$cid" >/dev/null 2>&1 || true
+          if [[ "$copy_result" -ne 0 ]]; then exit 1; fi
           echo "LINUX_FIXTURE_EXIT_CODE=$result"
           docker rm "$cid" >/dev/null
           if [[ -f "$evidence/positive/stages.env" ]]; then
