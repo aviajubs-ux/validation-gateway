@@ -1,0 +1,129 @@
+name: Windows 11 ARM64 Platform Probe
+
+on:
+  push:
+    paths:
+      - ".github/workflows/windows11-arm64-platform-probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows11-arm64-platform:
+    name: Windows 11 ARM64 API surface probe
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    steps:
+      - name: Verify Windows 11 client and probe native APIs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+          $productType = [int]$os.ProductType
+          $build = [int]$os.BuildNumber
+          $osArch = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          $processArch = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+          if ($productType -ne 1 -or $build -lt 22000 -or $osArch -ne 'Arm64') {
+            throw 'WINDOWS11_ARM64_RUNNER_IDENTITY_MISMATCH'
+          }
+
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+
+          public static class TeliPlatformProbeNative
+          {
+              [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+              public static extern IntPtr LoadLibraryW(string name);
+
+              [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+              public static extern IntPtr GetProcAddress(IntPtr module, string name);
+
+              [DllImport("kernel32.dll", SetLastError = true)]
+              public static extern IntPtr CreateJobObjectW(IntPtr attributes, string name);
+
+              [DllImport("kernel32.dll", SetLastError = true)]
+              public static extern bool CloseHandle(IntPtr handle);
+
+              [DllImport("advapi32.dll", SetLastError = true)]
+              public static extern IntPtr FreeSid(IntPtr sid);
+
+              [UnmanagedFunctionPointer(CallingConvention.Winapi, CharSet = CharSet.Unicode)]
+              public delegate int CreateAppContainerProfileDelegate(
+                  string name, string displayName, string description,
+                  IntPtr capabilities, uint capabilityCount, out IntPtr sid);
+
+              [UnmanagedFunctionPointer(CallingConvention.Winapi, CharSet = CharSet.Unicode)]
+              public delegate int DeleteAppContainerProfileDelegate(string name);
+          }
+          '@
+
+          $job = [TeliPlatformProbeNative]::CreateJobObjectW([IntPtr]::Zero, $null)
+          if ($job -eq [IntPtr]::Zero) { throw 'JOB_OBJECT_CREATE_FAILED' }
+          if (-not [TeliPlatformProbeNative]::CloseHandle($job)) { throw 'JOB_OBJECT_CLOSE_FAILED' }
+
+          $userenv = [TeliPlatformProbeNative]::LoadLibraryW('userenv.dll')
+          if ($userenv -eq [IntPtr]::Zero) { throw 'USERENV_LOAD_FAILED' }
+          $createPtr = [TeliPlatformProbeNative]::GetProcAddress($userenv, 'CreateAppContainerProfile')
+          $deletePtr = [TeliPlatformProbeNative]::GetProcAddress($userenv, 'DeleteAppContainerProfile')
+          if ($createPtr -eq [IntPtr]::Zero -or $deletePtr -eq [IntPtr]::Zero) {
+            throw 'APPCONTAINER_EXPORTS_UNAVAILABLE'
+          }
+
+          $create = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
+            $createPtr, [type][TeliPlatformProbeNative+CreateAppContainerProfileDelegate])
+          $delete = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
+            $deletePtr, [type][TeliPlatformProbeNative+DeleteAppContainerProfileDelegate])
+
+          $profileName = 'TELI-PLATFORM-PROBE-' + [Guid]::NewGuid().ToString('N')
+          $sid = [IntPtr]::Zero
+          $hr = $create.Invoke($profileName, 'TELI platform probe', 'Temporary capability probe', [IntPtr]::Zero, 0, [ref]$sid)
+          if ($hr -ne 0 -or $sid -eq [IntPtr]::Zero) { throw 'APPCONTAINER_PROFILE_CREATE_FAILED' }
+
+          try {
+            $deleteHr = $delete.Invoke($profileName)
+            if ($deleteHr -ne 0) { throw 'APPCONTAINER_PROFILE_DELETE_FAILED' }
+          } finally {
+            if ($sid -ne [IntPtr]::Zero) { [void][TeliPlatformProbeNative]::FreeSid($sid) }
+            [void][TeliPlatformProbeNative]::CloseHandle($userenv)
+          }
+
+          $pipeName = 'teli-platform-probe-' + [Guid]::NewGuid().ToString('N')
+          $server = [IO.Pipes.NamedPipeServerStream]::new(
+            $pipeName, [IO.Pipes.PipeDirection]::InOut, 1,
+            [IO.Pipes.PipeTransmissionMode]::Byte, [IO.Pipes.PipeOptions]::Asynchronous)
+          $client = [IO.Pipes.NamedPipeClientStream]::new(
+            '.', $pipeName, [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
+          try {
+            $wait = $server.WaitForConnectionAsync()
+            $client.Connect(5000)
+            $wait.GetAwaiter().GetResult()
+            $client.WriteByte(0x5A)
+            $client.Flush()
+            if ($server.ReadByte() -ne 0x5A) { throw 'NAMED_PIPE_LOOPBACK_FAILED' }
+          } finally {
+            $client.Dispose()
+            $server.Dispose()
+          }
+
+          $result = [ordered]@{
+            schema = 'teli.windows11_arm64_platform_probe.v1'
+            result = 'PASS_WINDOWS11_ARM64_PLATFORM_PROBE'
+            product_type = $productType
+            build = $build
+            os_architecture = $osArch
+            process_architecture = $processArch
+            runner_identity_is_admin = $isAdmin
+            appcontainer_profile_create_delete = $true
+            job_object_create_close = $true
+            named_pipe_loopback = $true
+            product_tests_executed = 0
+            x64_product_contract_proven = $false
+          }
+          $result | ConvertTo-Json -Depth 5
+          Write-Output 'WINDOWS11_ARM64_PLATFORM_PROBE_PASS'
