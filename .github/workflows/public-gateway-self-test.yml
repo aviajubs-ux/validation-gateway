@@ -1,0 +1,147 @@
+name: Public Gateway Self-Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/public-gateway-self-test.yml"
+      - ".github/workflows/manual-validation.yml"
+      - ".github/scripts/execute.ps1"
+      - ".github/scripts/seal.ps1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-gateway-self-test
+  cancel-in-progress: false
+
+jobs:
+  static-policy-validation:
+    name: Public script syntax and policy checks
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - name: Verify pinned public scripts and run checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $root = Join-Path $env:RUNNER_TEMP 'gateway-self-test'
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+
+          $checks = [System.Collections.Generic.List[object]]::new()
+          $failed = [System.Collections.Generic.List[string]]::new()
+
+          function Add-Check {
+            param([string]$Name, [bool]$Passed)
+            $state = if ($Passed) { 'PASS' } else { 'FAIL' }
+            $checks.Add([ordered]@{ name = $Name; status = $state })
+            if (-not $Passed) { $failed.Add($Name) }
+          }
+
+          function Get-RepositoryScript {
+            param([string]$Path)
+            $encodedPath = [Uri]::EscapeUriString($Path)
+            $uri = "https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/$encodedPath?ref=$env:GITHUB_SHA"
+            $item = Invoke-RestMethod -Uri $uri -Headers @{
+              Accept = 'application/vnd.github+json'
+              'X-GitHub-Api-Version' = '2022-11-28'
+            } -ErrorAction Stop
+
+            if ($item.encoding -ne 'base64' -or [string]::IsNullOrWhiteSpace($item.sha)) {
+              throw 'REPOSITORY_SCRIPT_METADATA_INVALID'
+            }
+
+            $bytes = [Convert]::FromBase64String(($item.content -replace '\s',''))
+            $header = [Text.Encoding]::UTF8.GetBytes("blob $($bytes.Length)`0")
+            $blob = [byte[]]::new($header.Length + $bytes.Length)
+            [Buffer]::BlockCopy($header, 0, $blob, 0, $header.Length)
+            [Buffer]::BlockCopy($bytes, 0, $blob, $header.Length, $bytes.Length)
+            $sha1 = [Security.Cryptography.SHA1]::Create()
+            try { $digest = $sha1.ComputeHash($blob) } finally { $sha1.Dispose() }
+            $actualSha = [Convert]::ToHexString($digest).ToLowerInvariant()
+            [Array]::Clear($blob, 0, $blob.Length)
+            [Array]::Clear($digest, 0, $digest.Length)
+
+            if ($actualSha -ne $item.sha.ToLowerInvariant()) {
+              [Array]::Clear($bytes, 0, $bytes.Length)
+              throw 'REPOSITORY_SCRIPT_BLOB_SHA_MISMATCH'
+            }
+
+            $localPath = Join-Path $root ([IO.Path]::GetFileName($Path))
+            [IO.File]::WriteAllBytes($localPath, $bytes)
+            [Array]::Clear($bytes, 0, $bytes.Length)
+            return [ordered]@{
+              path = $localPath
+              text = [IO.File]::ReadAllText($localPath, [Text.UTF8Encoding]::new($false))
+              sha = $actualSha
+            }
+          }
+
+          try {
+            $executor = Get-RepositoryScript '.github/scripts/execute.ps1'
+            $sealer = Get-RepositoryScript '.github/scripts/seal.ps1'
+
+            foreach ($scriptItem in @(
+              @{ name = 'executor'; value = $executor },
+              @{ name = 'sealer'; value = $sealer }
+            )) {
+              $tokens = $null
+              $parseErrors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile(
+                $scriptItem.value.path, [ref]$tokens, [ref]$parseErrors
+              ) | Out-Null
+              Add-Check -Name "$($scriptItem.name)_powershell_syntax" -Passed ($parseErrors.Count -eq 0)
+            }
+
+            $e = $executor.text
+            Add-Check -Name 'evidence_file_count_bounded' -Passed ($e.Contains('$items.Count -gt 10000'))
+            Add-Check -Name 'evidence_single_file_size_bounded' -Passed ($e.Contains('$item.Length -gt 50MB'))
+            Add-Check -Name 'evidence_total_size_bounded' -Passed ($e.Contains('$totalBytes -gt 200MB'))
+            Add-Check -Name 'evidence_path_containment' -Passed ($e.Contains('$full.StartsWith($root'))
+            Add-Check -Name 'evidence_reparse_points_rejected' -Passed ($e.Contains('CANDIDATE_EVIDENCE_REPARSE_POINT_REJECTED'))
+            Add-Check -Name 'candidate_write_acl_is_scoped' -Passed ($e.Contains('@($buildRoot,$candidateOutputRoot,$script:candidateTemp)'))
+            Add-Check -Name 'candidate_network_egress_blocked' -Passed ($e.Contains('-Direction Outbound -Action Block'))
+            Add-Check -Name 'candidate_secret_environment_cleared' -Passed ($e.Contains('Remove-Item -LiteralPath ("Env:" + $name)'))
+            Add-Check -Name 'candidate_environment_allowlisted' -Passed ($e.Contains('$safeEnvironment = @(') -and $e.Contains('$psi.Environment.Clear()'))
+            Add-Check -Name 'candidate_runs_as_temporary_user' -Passed ($e.Contains('$psi.UserName = $script:candidateUserName'))
+
+            $s = $sealer.text
+            Add-Check -Name 'evidence_aes_gcm_encryption' -Passed ($s.Contains('[Security.Cryptography.AesGcm]'))
+            Add-Check -Name 'evidence_encrypt_decrypt_self_check' -Passed ($s.Contains('$aes.Encrypt(') -and $s.Contains('$aes.Decrypt('))
+            Add-Check -Name 'evidence_encryption_key_zeroized' -Passed ($s.Contains('[Array]::Clear($key,0,$key.Length)'))
+            Add-Check -Name 'plaintext_archive_removed' -Passed ($s.Contains('Remove-Item -LiteralPath $plainArchive'))
+          }
+          catch {
+            $failed.Add('SCRIPT_FETCH_OR_VALIDATION_ERROR')
+            $checks.Add([ordered]@{ name = 'script_fetch_and_validation'; status = 'FAIL' })
+            Write-Output 'PUBLIC_SCRIPT_VALIDATION_ERROR'
+          }
+
+          $failCount = @($checks | Where-Object { $_.status -eq 'FAIL' }).Count
+          $report = [ordered]@{
+            schema = 'validation.gateway.public_policy_self_test.v1'
+            commit = $env:GITHUB_SHA
+            runner = 'windows-2025'
+            checks = @($checks)
+            total = $checks.Count
+            passed = $checks.Count - $failCount
+            failed = $failCount
+            outcome = if ($failCount -eq 0) { 'PASS' } else { 'FAIL' }
+          }
+          $reportPath = Join-Path $root 'public-policy-self-test.json'
+          $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding utf8
+          Write-Output ("PUBLIC_POLICY_SELF_TEST|{0}|{1}/{2}" -f $report.outcome, $report.passed, $report.total)
+          if ($failCount -gt 0) { exit 1 }
+
+      - name: Upload public test report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: public-gateway-policy-self-test
+          path: ${{ runner.temp }}/gateway-self-test/public-policy-self-test.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
