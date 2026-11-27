@@ -148,10 +148,7 @@ jobs:
             --entrypoint /bin/bash "$image" -euc '
               test "$(id -u)" = "65532"
               if touch /root/should-not-write 2>/dev/null; then exit 21; fi
-              python3 -c "import socket; s=socket.socket(); s.settimeout(1); 
-try: s.connect((\"1.1.1.1\",443)); raise SystemExit(22)
-except OSError: pass
-finally: s.close()"
+              python3 -c "import socket; s=socket.socket(); s.settimeout(1); rc=s.connect_ex(('1.1.1.1',443)); s.close(); assert rc != 0"
               echo "NETWORK_BLOCKED READONLY_ROOT STANDARD_USER PASS"
             '
       - name: Clean up images and temporary directories
