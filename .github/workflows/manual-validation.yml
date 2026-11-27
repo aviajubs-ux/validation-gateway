@@ -77,16 +77,13 @@ jobs:
         id: executor
         shell: pwsh
         run: |
-          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=a7547ce7492b7425c26a3c282bea878359967d53'
-          $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
-          if ($item.sha -ne 'aa2549525784da0dab93b4a5e064892a418d4311' -or $item.encoding -ne 'base64') {
+          $uri = 'https://raw.githubusercontent.com/aviajubs-ux/validation-gateway/a7547ce7492b7425c26a3c282bea878359967d53/.github/scripts/execute.ps1'
+          $scriptPath = Join-Path $env:RUNNER_TEMP 'generic-executor.ps1'
+          Invoke-WebRequest -Uri $uri -OutFile $scriptPath -MaximumRedirection 3 -ErrorAction Stop
+          $blob = (& git.exe hash-object $scriptPath).Trim()
+          if ($blob -ne 'aa2549525784da0dab93b4a5e064892a418d4311') {
             throw 'TRUSTED_EXECUTOR_INTEGRITY_FAILURE'
           }
-          $encoded = ($item.content -replace '\s','')
-          $bytes = [Convert]::FromBase64String($encoded)
-          $scriptPath = Join-Path $env:RUNNER_TEMP 'generic-executor.ps1'
-          [IO.File]::WriteAllBytes($scriptPath,$bytes)
-          [Array]::Clear($bytes,0,$bytes.Length)
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("path={0}" -f $scriptPath)
           Write-Output 'TRUSTED_EXECUTOR_LOADED'
       - name: Run public process-capture self-tests
@@ -122,16 +119,13 @@ jobs:
           $lane = '${{ inputs.lane }}'
           $env:EVIDENCE_KEY_B64 = $env:LANE_EVIDENCE_KEY_B64
           Remove-Item Env:LANE_EVIDENCE_KEY_B64 -ErrorAction SilentlyContinue
-          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/seal.ps1?ref=c66ecc54e592705fa723720825a361913d5443f9'
-          $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
-          if ($item.sha -ne 'd46036edbfb8a3866336eb10d6289caf0bb4c7ff' -or $item.encoding -ne 'base64') {
+          $sealUri = 'https://raw.githubusercontent.com/aviajubs-ux/validation-gateway/c66ecc54e592705fa723720825a361913d5443f9/.github/scripts/seal.ps1'
+          $sealScript = Join-Path $env:RUNNER_TEMP 'trusted-sealer.ps1'
+          Invoke-WebRequest -Uri $sealUri -OutFile $sealScript -MaximumRedirection 3 -ErrorAction Stop
+          $sealBlob = (& git.exe hash-object $sealScript).Trim()
+          if ($sealBlob -ne 'd46036edbfb8a3866336eb10d6289caf0bb4c7ff') {
             throw 'TRUSTED_SEAL_SCRIPT_INTEGRITY_FAILURE'
           }
-          $encoded = ($item.content -replace '\s','')
-          $bytes = [Convert]::FromBase64String($encoded)
-          $sealScript = Join-Path $env:RUNNER_TEMP 'trusted-sealer.ps1'
-          [IO.File]::WriteAllBytes($sealScript,$bytes)
-          [Array]::Clear($bytes,0,$bytes.Length)
           & $sealScript
           Remove-Item -LiteralPath $sealScript -Force -ErrorAction SilentlyContinue
       - name: Publish encrypted evidence only
