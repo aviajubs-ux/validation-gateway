@@ -10,28 +10,44 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 10
     steps:
-      - name: Load exact public executor
+      - name: Load and verify exact public executor
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=work/validation-gateway-bounded-process-20261126'
-          $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
-          if ($item.sha -ne 'aa2549525784da0dab93b4a5e064892a418d4311' -or $item.encoding -ne 'base64') {
+          $uri = 'https://raw.githubusercontent.com/aviajubs-ux/validation-gateway/46a8c14991e192afb5812c59949794bc50bb472c/.github/scripts/execute.ps1'
+          $scriptPath = Join-Path $env:RUNNER_TEMP 'generic-executor-selftest.ps1'
+          Invoke-WebRequest -Uri $uri -OutFile $scriptPath -MaximumRedirection 3 -ErrorAction Stop
+          $blob = (& git.exe hash-object $scriptPath).Trim()
+          if ($blob -ne 'aa2549525784da0dab93b4a5e064892a418d4311') {
             throw 'TRUSTED_EXECUTOR_INTEGRITY_FAILURE'
           }
-          $bytes = [Convert]::FromBase64String(($item.content -replace '\\s',''))
-          $scriptPath = Join-Path $env:RUNNER_TEMP 'generic-executor-selftest.ps1'
-          [IO.File]::WriteAllBytes($scriptPath,$bytes)
-          [Array]::Clear($bytes,0,$bytes.Length)
-          & pwsh.exe -NoLogo -NoProfile -NonInteractive -File $scriptPath -SelfTest
-          if ($LASTEXITCODE -ne 0) { throw 'PUBLIC_RUNNER_SELFTEST_FAILED' }
+          $evidenceDir = Join-Path $env:RUNNER_TEMP 'windows-runner-selftest-evidence'
+          New-Item -ItemType Directory -Path $evidenceDir -Force | Out-Null
+          $selfTestLog = Join-Path $evidenceDir 'runner-selftest.log'
+          & pwsh.exe -NoLogo -NoProfile -NonInteractive -File $scriptPath -SelfTest 2>&1 |
+            Tee-Object -FilePath $selfTestLog
+          $selfTestExit = $LASTEXITCODE
+          $markers = @(Select-String -Path $selfTestLog -Pattern '^SELFTEST_PASS_')
+          $summary = [ordered]@{
+            schema = 'validation.gateway.runner_selftest.v1'
+            runner_os = 'windows-2025'
+            executor_blob_sha = $blob
+            pass_markers = $markers.Count
+            failed = ($selfTestExit -ne 0 -or $markers.Count -ne 5)
+            exit_code = $selfTestExit
+          }
+          $summary | ConvertTo-Json -Depth 4 |
+            Set-Content -LiteralPath (Join-Path $evidenceDir 'summary.json') -Encoding utf8
+          if ($selfTestExit -ne 0 -or $markers.Count -ne 5) {
+            throw 'PUBLIC_RUNNER_SELFTEST_FAILED'
+          }
           Write-Output 'PUBLIC_RUNNER_SELFTEST_COMPLETED'
-  - name: Preserve Windows runner self-test evidence
-    if: always()
-    uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-    with:
-      name: windows-runner-selftest-evidence
-      path: ${{ runner.temp }}/windows-runner-selftest-evidence
-      if-no-files-found: warn
-      retention-days: 1
-      compression-level: 6
+      - name: Preserve Windows runner self-test evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: windows-runner-selftest-evidence
+          path: ${{ runner.temp }}/windows-runner-selftest-evidence
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 6
