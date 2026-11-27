@@ -96,6 +96,18 @@ else
   RESULT[configure_sanitizers]="FAIL"
 fi
 
+{
+  printf 'configure_on=%s\n' "${RESULT[configure_on]}" 
+  printf 'build_on=%s\n' "${RESULT[build_on]}"
+  printf 'ctest_on=%s\n' "${RESULT[ctest_on]}"
+  printf 'configure_off=%s\n' "${RESULT[configure_off]}"
+  printf 'off_gate=%s\n' "${RESULT[off_gate]}"
+  printf 'build_off=%s\n' "${RESULT[build_off]}"
+  printf 'configure_sanitizers=%s\n' "${RESULT[configure_sanitizers]}"
+  printf 'build_sanitizers=%s\n' "${RESULT[build_sanitizers]}"
+  printf 'ctest_sanitizers=%s\n' "${RESULT[ctest_sanitizers]}"
+} > "$EVIDENCE_ROOT/stages.env"
+
 python3 - "$EVIDENCE_ROOT" <<'PY'
 import json, pathlib, sys, xml.etree.ElementTree as ET
 root = pathlib.Path(sys.argv[1])
@@ -104,8 +116,10 @@ for line in (root / "toolchain.txt").read_text(errors="replace").splitlines():
     if "=" in line:
         k, v = line.split("=", 1)
         results[k] = v
-for key in ("configure_on","build_on","ctest_on","configure_off","off_gate","build_off","configure_sanitizers","build_sanitizers","ctest_sanitizers"):
-    results[key] = __import__("os").environ.get("RESULT_" + key.upper(), "UNKNOWN")
+for line in (root / "stages.env").read_text(errors="replace").splitlines():
+    if "=" in line:
+        k, v = line.split("=", 1)
+        results[k] = v
 summary = {"schema":"validation.gateway.linux_candidate_result.v1", "stages":results}
 for name, target in (("ctest-linux.xml","ctest_on_counts"),("ctest-sanitizers.xml","ctest_sanitizers_counts")):
     p = root / name
