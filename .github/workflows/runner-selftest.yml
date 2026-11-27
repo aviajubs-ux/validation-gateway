@@ -1,0 +1,48 @@
+name: Public Gateway Self-Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/scripts/execute.ps1'
+      - '.github/workflows/runner-selftest.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gateway-selftest:
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Fetch and verify the exact public executor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $uri = "https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=$env:GITHUB_SHA"
+          $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ErrorAction Stop
+          if ($item.encoding -ne 'base64' -or [string]::IsNullOrWhiteSpace($item.sha)) {
+            throw 'EXECUTOR_CONTENT_RESPONSE_INVALID'
+          }
+          $bytes = [Convert]::FromBase64String(($item.content -replace '\s',''))
+          $header = [Text.Encoding]::UTF8.GetBytes("blob $($bytes.Length)`0")
+          $blob = [byte[]]::new($header.Length + $bytes.Length)
+          [Buffer]::BlockCopy($header,0,$blob,0,$header.Length)
+          [Buffer]::BlockCopy($bytes,0,$blob,$header.Length,$bytes.Length)
+          $actual = [Convert]::ToHexString([Security.Cryptography.SHA1]::HashData($blob)).ToLowerInvariant()
+          if ($actual -ne $item.sha.ToLowerInvariant()) { throw 'EXECUTOR_BLOB_HASH_MISMATCH' }
+
+          $scriptPath = Join-Path $env:RUNNER_TEMP 'verified-executor.ps1'
+          [IO.File]::WriteAllBytes($scriptPath,$bytes)
+          [Array]::Clear($bytes,0,$bytes.Length)
+          [Array]::Clear($blob,0,$blob.Length)
+
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile($scriptPath,[ref]$tokens,[ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { throw 'EXECUTOR_POWERSHELL_SYNTAX_FAILURE' }
+
+          & pwsh.exe -NoLogo -NoProfile -NonInteractive -File $scriptPath -SelfTest
+          if ($LASTEXITCODE -ne 0) { throw 'EXECUTOR_SELFTEST_FAILED' }
+          Write-Output 'PUBLIC_GATEWAY_SELFTEST_COMPLETED'
