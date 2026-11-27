@@ -77,9 +77,9 @@ jobs:
         id: executor
         shell: pwsh
         run: |
-          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=e3cdc5c151fca20a82f80b76ba5fb73fa2450bc6'
+          $uri = 'https://api.github.com/repos/aviajubs-ux/validation-gateway/contents/.github/scripts/execute.ps1?ref=81c25aab092d283296ef675f619c5841db17f8cb'
           $item = Invoke-RestMethod -Uri $uri -Headers @{ Accept = 'application/vnd.github+json' } -MaximumRedirection 3 -ErrorAction Stop
-          if ($item.sha -ne '556f7e04fd49ae9d6e987fc90acf067673e65b4c' -or $item.encoding -ne 'base64') {
+          if ($item.sha -ne '0453f597b93a593f796979267e8f4fbeb8ac999e' -or $item.encoding -ne 'base64') {
             throw 'TRUSTED_EXECUTOR_INTEGRITY_FAILURE'
           }
           $encoded = ($item.content -replace '\s','')
