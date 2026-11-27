@@ -150,7 +150,15 @@ function Initialize-CandidateSandbox {
     # bootstrap inputs, encryption outputs, or the runner's result files.
     & $icacls $runRoot /grant $sidAceTraverse /Q | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_RUNROOT_TRAVERSE_ACL_FAILED' }
-    foreach ($writablePath in @($payloadRoot,$buildRoot,$candidateOutputRoot,$script:candidateTemp)) {
+    # Candidate input is immutable: the candidate identity can read/execute
+    # the extracted package but cannot alter source, tests, manifests or runner.
+    & $icacls $payloadRoot /deny $sidAceModify /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_PAYLOAD_READONLY_DENY_FAILED' }
+    $payloadReadAce = "*$($script:candidateSid):(OI)(CI)RX"
+    & $icacls $payloadRoot /grant $payloadReadAce /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_PAYLOAD_READONLY_GRANT_FAILED' }
+
+    foreach ($writablePath in @($buildRoot,$candidateOutputRoot,$script:candidateTemp)) {
         New-Item -ItemType Directory -Path $writablePath -Force | Out-Null
         & $icacls $writablePath /grant $sidAceModify /T /C /Q | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'SANDBOX_SCOPED_WRITE_ACL_FAILED' }
